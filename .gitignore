@@ -1,0 +1,52 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project-specific
+*.pt
+*.pth
+*.onnx
+*.ckpt
+data/
+data_cache/
+uploads/
+cache/
+*.db
+*.sqlite3
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+
+# Logs
+*.log
+lightning_logs/
+wandb/
+
+# Claude Code
+.claude/
+
+# Environment
+.env
+.env.local
