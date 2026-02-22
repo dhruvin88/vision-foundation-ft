@@ -50,6 +50,7 @@ class BaseDecoder(ABC, nn.Module):
         """
         with torch.no_grad():
             features = self.encoder.forward_features(images)
+        features["image"] = images
         return self.forward(features)
 
     def trainable_parameters(self) -> list[nn.Parameter]:

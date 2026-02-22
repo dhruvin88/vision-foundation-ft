@@ -28,8 +28,8 @@ def main() -> None:
     )
     train_parser.add_argument(
         "--encoder",
-        default="dinov2_vitb14",
-        help="Encoder model name (default: dinov2_vitb14)",
+        default="dinov3_vitb16",
+        help="Encoder model name (default: dinov3_vitb16)",
     )
     train_parser.add_argument(
         "--decoder",
@@ -57,7 +57,7 @@ def main() -> None:
     predict_parser = subparsers.add_parser("predict", help="Run inference with a trained model")
     predict_parser.add_argument("--image", required=True, help="Path to image or directory")
     predict_parser.add_argument("--weights", required=True, help="Path to decoder weights (.pt)")
-    predict_parser.add_argument("--encoder", default="dinov2_vitb14", help="Encoder model name")
+    predict_parser.add_argument("--encoder", default="dinov3_vitb16", help="Encoder model name")
     predict_parser.add_argument("--decoder", required=True, help="Decoder class name")
     predict_parser.add_argument("--num-classes", type=int, required=True, help="Number of classes")
     predict_parser.add_argument(
@@ -90,13 +90,13 @@ def main() -> None:
 
 def _run_train(args: argparse.Namespace) -> None:
     """Execute training from CLI args."""
-    from core.encoders.dinov2 import DINOv2Encoder
+    from core.encoders import create_encoder
     from core.data.dataset import FFTDataset
     from core.training.trainer import Trainer
 
     # Load encoder
     print(f"Loading encoder: {args.encoder}")
-    encoder = DINOv2Encoder(args.encoder)
+    encoder = create_encoder(args.encoder)
 
     # Create decoder
     decoder = _create_decoder(args.decoder, args.task, encoder, args.num_classes)
@@ -148,11 +148,11 @@ def _run_train(args: argparse.Namespace) -> None:
 
 def _run_predict(args: argparse.Namespace) -> None:
     """Execute inference from CLI args."""
-    from core.encoders.dinov2 import DINOv2Encoder
+    from core.encoders import create_encoder
     from core.evaluation.inference import run_inference
     from core.export.weights import load_decoder_weights
 
-    encoder = DINOv2Encoder(args.encoder)
+    encoder = create_encoder(args.encoder)
     decoder = _create_decoder(args.decoder, args.task, encoder, args.num_classes)
     load_decoder_weights(decoder, args.weights)
 
@@ -170,11 +170,11 @@ def _run_predict(args: argparse.Namespace) -> None:
 
 def _run_info() -> None:
     """Print available encoders and decoders."""
-    from core.encoders.dinov2 import ALL_VARIANTS
+    from core.encoders import ALL_ENCODER_VARIANTS
 
     print("Available Encoders:")
     print("-" * 50)
-    for name, config in ALL_VARIANTS.items():
+    for name, config in ALL_ENCODER_VARIANTS.items():
         print(f"  {name}: embed_dim={config['embed_dim']}, patch_size={config['patch_size']}")
 
     print("\nAvailable Decoders:")
@@ -184,7 +184,9 @@ def _run_info() -> None:
     print("    - mlp (MLPHead): 2-layer MLP with dropout")
     print("    - transformer (TransformerHead): Cross-attention decoder")
     print("  Detection:")
+    print("    - rtdetr (RTDETRDecoder): RT-DETRv2 with multi-scale, VFL, CDN [default]")
     print("    - detr_lite (DETRLiteDecoder): Lightweight DETR-style")
+    print("    - detr_multiscale (DETRMultiScaleDecoder): DETR with FPN-style multi-scale features")
     print("    - fpn (FPNHead): Feature Pyramid Network + anchors")
     print("  Segmentation:")
     print("    - linear_seg (LinearSegHead): Per-patch linear classifier")
@@ -195,7 +197,8 @@ def _run_info() -> None:
 def _create_decoder(decoder_name: str, task: str, encoder, num_classes: int):
     """Create a decoder by name or auto-select based on task."""
     from core.decoders.classification import LinearProbe, MLPHead, TransformerHead
-    from core.decoders.detection import DETRLiteDecoder, FPNHead
+    from core.decoders.detection import DETRLiteDecoder, DETRMultiScaleDecoder, FPNHead
+    from core.decoders.rtdetr import RTDETRDecoder
     from core.decoders.segmentation import LinearSegHead, UPerNetHead, MaskTransformerHead
 
     decoder_map = {
@@ -203,7 +206,9 @@ def _create_decoder(decoder_name: str, task: str, encoder, num_classes: int):
         "mlp": MLPHead,
         "transformer": TransformerHead,
         "detr_lite": DETRLiteDecoder,
+        "detr_multiscale": DETRMultiScaleDecoder,
         "fpn": FPNHead,
+        "rtdetr": RTDETRDecoder,
         "linear_seg": LinearSegHead,
         "upernet": UPerNetHead,
         "mask_transformer": MaskTransformerHead,
@@ -212,7 +217,7 @@ def _create_decoder(decoder_name: str, task: str, encoder, num_classes: int):
     # Auto-select defaults
     auto_defaults = {
         "classification": "linear_probe",
-        "detection": "detr_lite",
+        "detection": "rtdetr",
         "segmentation": "linear_seg",
     }
 

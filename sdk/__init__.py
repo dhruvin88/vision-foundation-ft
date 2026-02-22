@@ -5,7 +5,7 @@ A simple, high-level API for fine-tuning vision foundation models.
 Example:
     import foundation_ft as fft
 
-    encoder = fft.Encoder("dinov2_vitb14")
+    encoder = fft.Encoder("dinov3_vitb16")
     decoder = fft.ClassificationHead(encoder, num_classes=5, head_type="mlp")
     dataset = fft.Dataset.from_folder("./my_images/", task="classification")
     trainer = fft.Trainer(decoder, dataset, lr=1e-3, epochs=20)
@@ -13,7 +13,7 @@ Example:
     trainer.save("./my_model.pt")
 """
 
-from core.encoders.dinov2 import DINOv2Encoder
+from core.encoders import create_encoder
 from core.data.dataset import FFTDataset
 from core.training.trainer import Trainer
 from core.evaluation.inference import run_inference
@@ -22,6 +22,7 @@ from core.export.weights import save_decoder_weights, load_decoder_weights
 from core.export.script_gen import generate_inference_script
 from core.decoders.classification import LinearProbe, MLPHead, TransformerHead
 from core.decoders.detection import DETRLiteDecoder, FPNHead
+from core.decoders.rtdetr import RTDETRDecoder
 from core.decoders.segmentation import LinearSegHead, UPerNetHead, MaskTransformerHead
 
 
@@ -29,8 +30,8 @@ class Encoder:
     """High-level encoder wrapper.
 
     Args:
-        model_name: DINOv2 variant name (e.g., 'dinov2_vitb14').
-        input_size: Input image size (default 518).
+        model_name: Encoder variant name (e.g., 'dinov3_vitb16', 'dinov2_vitb14').
+        input_size: Input image size. If None, uses the encoder's default.
         intermediate_layers: List of layer indices for multi-scale feature extraction.
             Required for FPN (detection) and UPerNet (segmentation) heads.
             If None, only final-layer features are extracted.
@@ -38,15 +39,16 @@ class Encoder:
 
     def __init__(
         self,
-        model_name: str = "dinov2_vitb14",
-        input_size: int = 518,
+        model_name: str = "dinov3_vitb16",
+        input_size: int | None = None,
         intermediate_layers: list[int] | None = None,
     ):
-        self._encoder = DINOv2Encoder(
-            model_name=model_name,
-            input_size=input_size,
-            intermediate_layers=intermediate_layers,
-        )
+        kwargs = {}
+        if input_size is not None:
+            kwargs["input_size"] = input_size
+        if intermediate_layers is not None:
+            kwargs["intermediate_layers"] = intermediate_layers
+        self._encoder = create_encoder(model_name, **kwargs)
 
     @property
     def model(self):
@@ -82,13 +84,13 @@ def ClassificationHead(encoder, num_classes: int, head_type: str = "linear"):
     return heads[head_type](enc, num_classes)
 
 
-def DetectionHead(encoder, num_classes: int, head_type: str = "detr_lite", **kwargs):
+def DetectionHead(encoder, num_classes: int, head_type: str = "rtdetr", **kwargs):
     """Create a detection head.
 
     Args:
         encoder: An Encoder instance or DINOv2Encoder.
         num_classes: Number of object classes.
-        head_type: 'detr_lite' or 'fpn'.
+        head_type: 'rtdetr' (default), 'detr_lite', or 'fpn'.
 
     Returns:
         A detection decoder.
@@ -97,6 +99,7 @@ def DetectionHead(encoder, num_classes: int, head_type: str = "detr_lite", **kwa
     heads = {
         "detr_lite": DETRLiteDecoder,
         "fpn": FPNHead,
+        "rtdetr": RTDETRDecoder,
     }
     if head_type not in heads:
         raise ValueError(f"Unknown head_type: {head_type}. Choose from: {list(heads.keys())}")
@@ -106,6 +109,7 @@ def DetectionHead(encoder, num_classes: int, head_type: str = "detr_lite", **kwa
         if enc.intermediate_layers is None:
             enc.intermediate_layers = enc.default_intermediate_layers()
 
+    # RTDETRDecoder sets its own intermediate_layers in __init__
     return heads[head_type](enc, num_classes, **kwargs)
 
 
@@ -147,6 +151,7 @@ __all__ = [
     "SegmentationHead",
     "Dataset",
     "Trainer",
+    "RTDETRDecoder",
     "run_inference",
     "compute_metrics",
     "save_decoder_weights",

@@ -105,6 +105,25 @@ def mock_encoder():
 
 
 @pytest.fixture
+def mock_encoder_v3():
+    """Create a mock encoder with DINOv3 dimensions (patch_size=16, input_size=512)."""
+    return MockEncoder(embed_dim=768, patch_size=16, input_size=512)
+
+
+@pytest.fixture
+def mock_features_v3():
+    """Create mock encoder features with DINOv3 dimensions."""
+    B, N, D = 2, 1024, 768  # 32*32 patches for 512/16
+    h = w = 32
+    patch_tokens = torch.randn(B, N, D)
+    return {
+        "cls_token": torch.randn(B, D),
+        "patch_tokens": patch_tokens,
+        "spatial_features": patch_tokens.permute(0, 2, 1).reshape(B, D, h, w),
+    }
+
+
+@pytest.fixture
 def mock_features():
     """Create mock encoder features for testing decoders."""
     B, N, D = 2, 1369, 768  # 37*37 patches for 518/14
@@ -114,6 +133,20 @@ def mock_features():
         "cls_token": torch.randn(B, D),
         "patch_tokens": patch_tokens,
         "spatial_features": patch_tokens.permute(0, 2, 1).reshape(B, D, h, w),
+    }
+
+
+@pytest.fixture
+def mock_features_rtdetr(mock_encoder):
+    """Create mock encoder features for RTDETRDecoder (includes intermediate + image)."""
+    B, D, h, w = 2, 768, 37, 37
+    patch_tokens = torch.randn(B, h * w, D)
+    return {
+        "cls_token": torch.randn(B, D),
+        "patch_tokens": patch_tokens,
+        "spatial_features": patch_tokens.permute(0, 2, 1).reshape(B, D, h, w),
+        "intermediate": [torch.randn(B, D, h, w) for _ in range(3)],
+        "image": torch.randn(B, 3, 518, 518),
     }
 
 
