@@ -59,7 +59,7 @@ class TrainingRun(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     project_id: int = Field(foreign_key="project.id", index=True)
     status: str = Field(default="pending", description="pending, running, completed, failed, cancelled")
-    encoder_name: str = "dinov2_vitb14"
+    encoder_name: str = "dinov3_vitb16"
     decoder_name: str = "auto"
     num_classes: int = 2
     learning_rate: float = 1e-3

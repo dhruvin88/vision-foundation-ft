@@ -27,11 +27,10 @@ def load_model(weights_path: str, device: str = "auto"):
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Load frozen DINOv2 encoder
-    encoder = torch.hub.load("facebookresearch/dinov2", "{encoder_name}", pretrained=True)
-    encoder.eval()
-    for param in encoder.parameters():
-        param.requires_grad = False
+    # Load frozen encoder
+    from core.encoders import create_encoder
+
+    enc = create_encoder("{encoder_name}", input_size={input_size})
 
     # Load decoder weights
     checkpoint = torch.load(weights_path, map_location=device, weights_only=True)
@@ -39,13 +38,8 @@ def load_model(weights_path: str, device: str = "auto"):
     metadata = checkpoint.get("metadata", {{}})
 
     # Reconstruct decoder
-    from core.decoders.{task} import {decoder_class}
-    from core.encoders.dinov2 import DINOv2Encoder
-
-    enc = DINOv2Encoder("{encoder_name}")
     num_classes = metadata.get("num_classes", {num_classes})
 
-    # Import and instantiate the decoder
     from core.decoders import {decoder_class}
     decoder = {decoder_class}(enc, num_classes={num_classes})
     decoder.load_state_dict({{**{{k: v for k, v in decoder.state_dict().items() if k.startswith("encoder.")}}, **decoder_state}})
@@ -119,10 +113,10 @@ if __name__ == "__main__":
 def generate_inference_script(
     decoder_class: str,
     task: str,
-    encoder_name: str = "dinov2_vitb14",
+    encoder_name: str = "dinov3_vitb16",
     num_classes: int = 2,
     weights_path: str = "model_weights.pt",
-    input_size: int = 518,
+    input_size: int = 512,
     output_path: str | Path = "inference.py",
 ) -> str:
     """Generate a standalone Python inference script.
@@ -130,7 +124,7 @@ def generate_inference_script(
     Args:
         decoder_class: Name of the decoder class (e.g., 'LinearProbe').
         task: Task type ('classification', 'detection', 'segmentation').
-        encoder_name: DINOv2 model variant name.
+        encoder_name: Encoder model variant name.
         num_classes: Number of classes.
         weights_path: Path to the saved decoder weights.
         input_size: Input image size.

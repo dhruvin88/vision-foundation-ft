@@ -192,6 +192,18 @@ class ProposalNetwork(nn.Module):
         return query_content, query_ref_pts, enc_logits, enc_boxes
 
 
+class SwiGLUFFN(nn.Module):
+    def __init__(self, d_model, dim_feedforward, dropout):
+        super().__init__()
+        self.w1 = nn.Linear(d_model, dim_feedforward)
+        self.w3 = nn.Linear(d_model, dim_feedforward)
+        self.w2 = nn.Linear(dim_feedforward, d_model)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x):
+        return self.drop(self.w2(F.silu(self.w1(x)) * self.w3(x)))
+
+
 class RTDETRDecoderLayer(nn.Module):
     """Pre-norm decoder layer: self-attn → cross-attn → FFN + iterative box refinement."""
 
@@ -210,16 +222,10 @@ class RTDETRDecoderLayer(nn.Module):
         self.cross_attn = nn.MultiheadAttention(
             hidden_dim, num_heads, dropout=dropout, batch_first=True
         )
-        self.ffn = nn.Sequential(
-            nn.Linear(hidden_dim, dim_feedforward),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim_feedforward, hidden_dim),
-            nn.Dropout(dropout),
-        )
-        self.norm1 = nn.LayerNorm(hidden_dim)
-        self.norm2 = nn.LayerNorm(hidden_dim)
-        self.norm3 = nn.LayerNorm(hidden_dim)
+        self.ffn = SwiGLUFFN(hidden_dim, dim_feedforward, dropout)
+        self.norm1 = nn.RMSNorm(hidden_dim)
+        self.norm2 = nn.RMSNorm(hidden_dim)
+        self.norm3 = nn.RMSNorm(hidden_dim)
         self.cls_head = nn.Linear(hidden_dim, num_classes)
         self.bbox_head = _MLP(hidden_dim, hidden_dim, 4, num_layers=2)
 
@@ -468,6 +474,8 @@ class RTDETRDecoder(BaseDecoder):
             box_noise_scale=box_noise_scale,
         )
 
+        self.cdn_enabled: bool = True
+
         # Lazy anchor cache keyed by (scale_sizes tuple)
         self._anchors_cache: dict = {}
 
@@ -548,7 +556,7 @@ class RTDETRDecoder(BaseDecoder):
         num_cdn = 0
         cdn_meta: dict | None = None
 
-        if self.training and "gt_labels" in features and "gt_boxes" in features:
+        if self.training and self.cdn_enabled and "gt_labels" in features and "gt_boxes" in features:
             cdn_result = self.cdn_builder.build(
                 features["gt_labels"], features["gt_boxes"], self.label_embedding
             )

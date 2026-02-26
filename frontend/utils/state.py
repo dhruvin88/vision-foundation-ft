@@ -5,7 +5,7 @@ import streamlit as st
 
 DEFAULTS = {
     "task": "classification",
-    "encoder_name": "dinov2_vitb14",
+    "encoder_name": "dinov3_vitb16",
     "encoder": None,
     "decoder": None,
     "decoder_config": {},

@@ -18,14 +18,19 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 st.subheader("Encoder")
 
 ENCODER_VARIANTS = {
-    "dinov2_vits14": {"embed_dim": 384, "params": "21M", "num_blocks": 12},
-    "dinov2_vitb14": {"embed_dim": 768, "params": "86M", "num_blocks": 12},
-    "dinov2_vitl14": {"embed_dim": 1024, "params": "300M", "num_blocks": 24},
-    "dinov2_vitg14": {"embed_dim": 1536, "params": "1.1B", "num_blocks": 40},
+    # DINOv3 variants (recommended)
+    "dinov3_vits16": {"embed_dim": 384, "params": "22M", "num_blocks": 12, "patch_size": 16},
+    "dinov3_vitb16": {"embed_dim": 768, "params": "86M", "num_blocks": 12, "patch_size": 16},
+    "dinov3_vitl16": {"embed_dim": 1024, "params": "300M", "num_blocks": 24, "patch_size": 16},
+    # DINOv2 variants
+    "dinov2_vits14": {"embed_dim": 384, "params": "21M", "num_blocks": 12, "patch_size": 14},
+    "dinov2_vitb14": {"embed_dim": 768, "params": "86M", "num_blocks": 12, "patch_size": 14},
+    "dinov2_vitl14": {"embed_dim": 1024, "params": "300M", "num_blocks": 24, "patch_size": 14},
+    "dinov2_vitg14": {"embed_dim": 1536, "params": "1.1B", "num_blocks": 40, "patch_size": 14},
 }
 
 encoder_name = st.selectbox(
-    "DINOv2 variant",
+    "Encoder variant",
     list(ENCODER_VARIANTS.keys()),
     index=list(ENCODER_VARIANTS.keys()).index(get("encoder_name")),
 )
@@ -35,7 +40,7 @@ col1, col2, col3 = st.columns(3)
 with col1:
     st.metric("Embedding dim", info["embed_dim"])
 with col2:
-    st.metric("Patch size", 14)
+    st.metric("Patch size", info["patch_size"])
 with col3:
     st.metric("Parameters", info["params"])
 

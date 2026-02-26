@@ -48,10 +48,15 @@ class TestEncodersEndpoint:
         response = client.get("/api/encoders")
         assert response.status_code == 200
         data = response.json()
+        # DINOv2 variants
         assert "dinov2_vits14" in data
         assert "dinov2_vitb14" in data
         assert "dinov2_vitl14" in data
         assert "dinov2_vitg14" in data
+        # DINOv3 variants
+        assert "dinov3_vits16" in data
+        assert "dinov3_vitb16" in data
+        assert "dinov3_vitl16" in data
 
     def test_encoder_has_config(self, client):
         response = client.get("/api/encoders")
@@ -60,6 +65,14 @@ class TestEncodersEndpoint:
         assert vitb["embed_dim"] == 768
         assert vitb["patch_size"] == 14
         assert vitb["num_heads"] == 12
+
+    def test_dinov3_encoder_config(self, client):
+        response = client.get("/api/encoders")
+        data = response.json()
+        vitb3 = data["dinov3_vitb16"]
+        assert vitb3["embed_dim"] == 768
+        assert vitb3["patch_size"] == 16
+        assert vitb3["num_heads"] == 12
 
     def test_register_variants_listed(self, client):
         response = client.get("/api/encoders")

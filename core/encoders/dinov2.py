@@ -6,6 +6,7 @@ All models are loaded from torch.hub (facebookresearch/dinov2).
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from typing import Literal
 
@@ -88,6 +89,7 @@ class DINOv2Encoder(BaseEncoder):
 
         # Freeze immediately
         self.freeze()
+        self._lora_enabled = False
         logger.info(
             "Loaded and froze %s (embed_dim=%d, patch_size=%d)",
             model_name,
@@ -145,7 +147,43 @@ class DINOv2Encoder(BaseEncoder):
         """Spatial grid size (height = width) of the patch tokens."""
         return self._input_size // self.patch_size
 
-    @torch.no_grad()
+    @property
+    def _fwd_ctx(self):
+        """Return nullcontext when LoRA is active (grads needed), else no_grad."""
+        return contextlib.nullcontext() if self._lora_enabled else torch.no_grad()
+
+    def enable_lora(
+        self,
+        rank: int = 4,
+        alpha: float = 4.0,
+        target_modules: list[str] | None = None,
+    ) -> int:
+        """Inject LoRA adapters into attention layers and unfreeze them.
+
+        Args:
+            rank: Low-rank dimension.
+            alpha: Scaling factor (scale = alpha / rank).
+            target_modules: List of layer name suffixes to patch.
+                Defaults to ["attn.qkv", "attn.proj"].
+
+        Returns:
+            Number of layers patched.
+        """
+        from core.encoders.lora import apply_lora
+
+        if target_modules is None:
+            target_modules = ["attn.qkv", "attn.proj"]
+        n = apply_lora(self.model, rank, alpha, target_modules)
+        self._lora_enabled = True
+        for name, param in self.model.named_parameters():
+            if "lora_" in name:
+                param.requires_grad = True
+        return n
+
+    def lora_parameters(self):
+        """Return list of trainable LoRA parameters."""
+        return [p for n, p in self.model.named_parameters() if "lora_" in n]
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Extract CLS token features.
 
@@ -156,9 +194,9 @@ class DINOv2Encoder(BaseEncoder):
         Returns:
             CLS token features of shape (B, embed_dim).
         """
-        return self.model(x)
+        with self._fwd_ctx:
+            return self.model(x)
 
-    @torch.no_grad()
     def forward_features(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         """Extract detailed features including CLS and patch tokens.
 
@@ -173,28 +211,29 @@ class DINOv2Encoder(BaseEncoder):
             - 'intermediate' (optional): list of (B, num_patches, embed_dim) from
               intermediate layers if intermediate_layers was specified
         """
-        features = self.model.forward_features(x)
+        with self._fwd_ctx:
+            features = self.model.forward_features(x)
 
-        # DINOv2 returns dict with 'x_norm_clstoken' and 'x_norm_patchtokens'
-        cls_token = features["x_norm_clstoken"]  # (B, embed_dim)
-        patch_tokens = features["x_norm_patchtokens"]  # (B, N, embed_dim)
+            # DINOv2 returns dict with 'x_norm_clstoken' and 'x_norm_patchtokens'
+            cls_token = features["x_norm_clstoken"]  # (B, embed_dim)
+            patch_tokens = features["x_norm_patchtokens"]  # (B, N, embed_dim)
 
-        B, N, D = patch_tokens.shape
-        h = w = int(N**0.5)
-        spatial = patch_tokens.permute(0, 2, 1).reshape(B, D, h, w)
+            B, N, D = patch_tokens.shape
+            h = w = int(N**0.5)
+            spatial = patch_tokens.permute(0, 2, 1).reshape(B, D, h, w)
 
-        result = {
-            "cls_token": cls_token,
-            "patch_tokens": patch_tokens,
-            "spatial_features": spatial,
-        }
+            result = {
+                "cls_token": cls_token,
+                "patch_tokens": patch_tokens,
+                "spatial_features": spatial,
+            }
 
-        # Extract intermediate layer features if requested
-        if self._intermediate_layers:
-            intermediates = self.model.get_intermediate_layers(
-                x, n=self._intermediate_layers, reshape=True
-            )
-            result["intermediate"] = list(intermediates)
+            # Extract intermediate layer features if requested
+            if self._intermediate_layers:
+                intermediates = self.model.get_intermediate_layers(
+                    x, n=self._intermediate_layers, reshape=True
+                )
+                result["intermediate"] = list(intermediates)
 
         return result
 

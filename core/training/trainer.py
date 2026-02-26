@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from pathlib import Path
 from typing import Any, Literal
@@ -103,6 +104,8 @@ class DecoderLightningModule(pl.LightningModule):
         warmup_epochs: int = 5,
         weight_decay: float = 0.01,
         total_epochs: int = 50,
+        deim_mode: bool = False,
+        mosaic_dataset=None,
     ) -> None:
         super().__init__()
         self.decoder = decoder
@@ -112,14 +115,34 @@ class DecoderLightningModule(pl.LightningModule):
         self.warmup_epochs = warmup_epochs
         self.weight_decay = weight_decay
         self.total_epochs = total_epochs
+        self.deim_mode = deim_mode
+        self.mosaic_dataset = mosaic_dataset
 
-        # Ensure encoder is frozen and not part of optimizer
+        # Freeze encoder base weights. Re-enable LoRA params if present,
+        # since freeze() would otherwise zero their requires_grad.
         self.decoder.encoder.freeze()
+        if getattr(self.decoder.encoder, "_lora_enabled", False):
+            for name, param in self.decoder.encoder.model.named_parameters():
+                if "lora_" in name:
+                    param.requires_grad = True
 
         # mAP metric for detection validation (IoU-based, proper COCO-style)
         if self.task == "detection":
             from torchmetrics.detection import MeanAveragePrecision
-            self.val_map = MeanAveragePrecision(box_format="xyxy", iou_type="bbox")
+            self.val_map = MeanAveragePrecision(
+                box_format="xyxy", iou_type="bbox"
+            )
+
+    def on_train_epoch_start(self) -> None:
+        if not self.deim_mode:
+            return
+        epoch = self.current_epoch
+        # Disable Mosaic after 50% of training
+        if self.mosaic_dataset is not None:
+            self.mosaic_dataset.enabled = epoch < self.total_epochs * 0.5
+        # Disable CDN noise in final 2 epochs
+        if hasattr(self.decoder, "cdn_enabled"):
+            self.decoder.cdn_enabled = epoch < self.total_epochs - 2
 
     def forward(self, features: dict[str, torch.Tensor]) -> Any:
         return self.decoder(features)
@@ -218,6 +241,7 @@ class DecoderLightningModule(pl.LightningModule):
         num_classes: int,
         alpha: float = 0.75,
         gamma: float = 2.0,
+        mal_gamma: float = 1.5,
     ) -> torch.Tensor:
         """Varifocal classification loss for RT-DETR.
 
@@ -226,6 +250,7 @@ class DecoderLightningModule(pl.LightningModule):
             target_labels: (B, Q) matched class indices, -1 for unmatched
             iou_scores:    (B, Q) IoU of matched predictions (0 for unmatched)
             num_classes:   number of foreground classes
+            mal_gamma:     MAL exponent applied to IoU soft targets (DEIM)
         """
         B, Q, C = pred_logits.shape
         device = pred_logits.device
@@ -234,7 +259,7 @@ class DecoderLightningModule(pl.LightningModule):
         valid_mask = target_labels >= 0
         if valid_mask.any():
             b_idx, q_idx = torch.where(valid_mask)
-            targets[b_idx, q_idx, target_labels[valid_mask]] = iou_scores[valid_mask]
+            targets[b_idx, q_idx, target_labels[valid_mask]] = iou_scores[valid_mask].pow(mal_gamma)
 
         with torch.no_grad():
             pred_sig = pred_logits.sigmoid()
@@ -244,6 +269,87 @@ class DecoderLightningModule(pl.LightningModule):
         )
         pos_count = float(valid_mask.sum().clamp(min=1))
         return loss / pos_count
+
+    def _detection_loss_rtdetr_simple(
+        self,
+        predictions: dict,
+        target_labels: torch.Tensor,
+        target_boxes: torch.Tensor,
+    ) -> torch.Tensor:
+        """Simplified RT-DETR loss for debugging: BCE + L1 + GIoU, no CDN/aux."""
+        from scipy.optimize import linear_sum_assignment
+        from torchvision.ops import generalized_box_iou
+
+        pred_logits = predictions["pred_logits"]  # (B, Q, C)
+        pred_boxes = predictions["pred_boxes"]    # (B, Q, 4)
+        B, Q, C = pred_logits.shape
+        num_classes = C
+        device = pred_logits.device
+
+        def cxcywh_to_xyxy(boxes: torch.Tensor) -> torch.Tensor:
+            cx, cy, w, h = boxes.unbind(-1)
+            return torch.stack(
+                [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], dim=-1
+            ).clamp(0, 1)
+
+        # --- Hungarian matching ---
+        target_onehot = torch.zeros(B, Q, C, device=device)
+        all_matched_pred = []
+        all_matched_tgt = []
+
+        for b in range(B):
+            valid = target_labels[b] >= 0
+            gt_labels_b = target_labels[b][valid]
+            gt_boxes_b = target_boxes[b][valid]
+            num_gt = gt_labels_b.shape[0]
+
+            if num_gt == 0:
+                continue
+
+            with torch.no_grad():
+                scores = pred_logits[b].sigmoid()
+                cls_cost = -scores[:, gt_labels_b]
+                bbox_cost = torch.cdist(pred_boxes[b], gt_boxes_b, p=1)
+                pred_xyxy = cxcywh_to_xyxy(pred_boxes[b])
+                gt_xyxy = cxcywh_to_xyxy(gt_boxes_b)
+                giou = generalized_box_iou(pred_xyxy, gt_xyxy)
+                cost = cls_cost + 5.0 * bbox_cost + 2.0 * (-giou)
+
+            row_idx, col_idx = linear_sum_assignment(cost.detach().cpu().numpy())
+            for r, c in zip(row_idx, col_idx):
+                target_onehot[b, r, gt_labels_b[c]] = 1.0
+            all_matched_pred.append(pred_boxes[b][row_idx])
+            all_matched_tgt.append(gt_boxes_b[col_idx])
+
+        # Focal-weighted BCE classification (prevent negative dominance)
+        # With 300 queries and ~1 GT per image, unweighted BCE drives all
+        # logits deeply negative.  Use alpha-balanced focal loss instead.
+        alpha = 0.25   # down-weight negatives
+        gamma = 2.0    # focus on hard examples
+        p = pred_logits.sigmoid()
+        bce = F.binary_cross_entropy_with_logits(
+            pred_logits, target_onehot, reduction="none"
+        )
+        # focal modulation
+        p_t = p * target_onehot + (1 - p) * (1 - target_onehot)
+        alpha_t = alpha * target_onehot + (1 - alpha) * (1 - target_onehot)
+        focal_weight = alpha_t * (1 - p_t).pow(gamma)
+        cls_loss = (focal_weight * bce).sum() / max(target_onehot.sum().item(), 1.0)
+
+        # L1 + GIoU on matched queries
+        if all_matched_pred:
+            matched_pred = torch.cat(all_matched_pred, dim=0)
+            matched_tgt = torch.cat(all_matched_tgt, dim=0)
+            l1_loss = F.l1_loss(matched_pred, matched_tgt)
+            giou_mat = generalized_box_iou(
+                cxcywh_to_xyxy(matched_pred), cxcywh_to_xyxy(matched_tgt)
+            )
+            giou_loss = (1 - giou_mat.diag()).mean()
+        else:
+            l1_loss = torch.tensor(0.0, device=device)
+            giou_loss = torch.tensor(0.0, device=device)
+
+        return cls_loss + 5.0 * l1_loss + 2.0 * giou_loss
 
     def _detection_loss_rtdetr(
         self,
@@ -313,7 +419,7 @@ class DecoderLightningModule(pl.LightningModule):
                     iou_scores[b, r] = giou_mat[r, c].clamp(0)
 
         # VFL classification loss
-        vfl = self._varifocal_loss(pred_logits, full_tgt_labels, iou_scores, num_classes)
+        vfl = self._varifocal_loss(pred_logits, full_tgt_labels, iou_scores, num_classes, mal_gamma=1.5)
 
         # L1 + GIoU on matched foreground queries
         valid_mask = full_tgt_labels >= 0
@@ -331,8 +437,10 @@ class DecoderLightningModule(pl.LightningModule):
 
         total_loss = vfl + 5.0 * l1_loss + 2.0 * giou_loss
 
-        # Auxiliary decoder layer losses (re-use same matching)
-        for aux in predictions.get("aux_outputs", []):
+        # Auxiliary decoder layer losses (re-use same matching).
+        # aux_outputs includes ALL decoder layers; skip the last one because
+        # it is the same tensor as pred_logits/pred_boxes (already counted above).
+        for aux in predictions.get("aux_outputs", [])[:-1]:
             aux_vfl = self._varifocal_loss(
                 aux["pred_logits"], full_tgt_labels, iou_scores, num_classes
             )
@@ -346,16 +454,6 @@ class DecoderLightningModule(pl.LightningModule):
                 aux_l1 = torch.tensor(0.0, device=device)
                 aux_giou = torch.tensor(0.0, device=device)
             total_loss = total_loss + aux_vfl + 5.0 * aux_l1 + 2.0 * aux_giou
-
-        # Encoder auxiliary loss (all-background BCE, weight 0.5)
-        enc_out = predictions.get("enc_outputs")
-        if enc_out is not None:
-            enc_logits = enc_out["pred_logits"]
-            enc_target = torch.zeros_like(enc_logits)
-            enc_loss = 0.5 * F.binary_cross_entropy_with_logits(
-                enc_logits, enc_target, reduction="mean"
-            )
-            total_loss = total_loss + enc_loss
 
         # CDN loss
         cdn_outputs = predictions.get("cdn_outputs")
@@ -414,7 +512,12 @@ class DecoderLightningModule(pl.LightningModule):
     def _extract_features(self, batch: dict) -> dict[str, torch.Tensor]:
         """Extract encoder features from batch images."""
         images = batch["image"]
-        with torch.no_grad():
+        ctx = (
+            contextlib.nullcontext()
+            if getattr(self.decoder.encoder, "_lora_enabled", False)
+            else torch.no_grad()
+        )
+        with ctx:
             features = self.decoder.encoder.forward_features(images)
         features["image"] = images  # thread raw pixels for CNN branch
         return features
@@ -468,25 +571,18 @@ class DecoderLightningModule(pl.LightningModule):
 
                 # Build torchmetrics-compatible per-image prediction/target dicts
                 map_preds, map_targets = [], []
+                num_classes = C if "enc_outputs" in predictions else C - 1
                 for b in range(B):
                     if "enc_outputs" in predictions:
-                        # RTDETRDecoder: sigmoid scores, no background class.
-                        # sigmoid(0) = 0.5, so use 0.3 threshold (RT-DETR standard)
-                        # to avoid flooding the metric with low-confidence noise.
                         scores, labels = pred_logits[b].sigmoid().max(-1)
-                        score_thresh = 0.3
                     else:
-                        # DETRLite: softmax with background at index num_classes
-                        probs = pred_logits[b].softmax(-1)  # (Q, C)
+                        probs = pred_logits[b].softmax(-1)
                         scores, labels = probs[:, :num_classes].max(-1)
-                        score_thresh = 0.05
 
-                    # Filter out background queries (low fg score)
-                    fg_mask = scores > score_thresh
                     map_preds.append({
-                        "boxes": cxcywh_to_xyxy(pred_boxes[b][fg_mask]),
-                        "scores": scores[fg_mask],
-                        "labels": labels[fg_mask],
+                        "boxes": cxcywh_to_xyxy(pred_boxes[b]),
+                        "scores": scores,
+                        "labels": labels,
                     })
 
                     valid = batch["labels"][b] >= 0
@@ -566,6 +662,8 @@ class Trainer:
         accelerator: str = "auto",
         devices: int | str = "auto",
         val_ratio: float = 0.2,
+        training_mode: Literal["standard", "deim"] = "standard",
+        lora_rank: int = 0,
     ) -> None:
         self.decoder = decoder
         self.epochs = epochs
@@ -580,6 +678,18 @@ class Trainer:
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
 
+        # Enable LoRA on the encoder if requested
+        if lora_rank > 0:
+            n = decoder.encoder.enable_lora(rank=lora_rank)
+            logger.info("LoRA enabled: rank=%d, %d layers patched", lora_rank, n)
+
+        # Wrap train dataset with Mosaic for DEIM mode
+        self._mosaic_dataset = None
+        if training_mode == "deim" and decoder.task == "detection":
+            from core.data.augmentations import MosaicDetectionDataset
+            self._mosaic_dataset = MosaicDetectionDataset(self.train_dataset)
+            self.train_dataset = self._mosaic_dataset
+
         # Create Lightning module
         self.lightning_module = DecoderLightningModule(
             decoder=decoder,
@@ -587,14 +697,20 @@ class Trainer:
             scheduler_type=scheduler,
             warmup_epochs=warmup_epochs,
             total_epochs=epochs,
+            deim_mode=(training_mode == "deim"),
+            mosaic_dataset=self._mosaic_dataset,
         )
 
         # Configure callbacks
         callbacks = [MetricsLoggerCallback()]
 
         if early_stopping_patience > 0:
-            monitor = "val_acc" if decoder.task == "classification" else "val_loss"
-            mode = "max" if decoder.task == "classification" else "min"
+            if decoder.task == "classification":
+                monitor, mode = "val_acc", "max"
+            elif decoder.task == "detection":
+                monitor, mode = "val_map50", "max"
+            else:
+                monitor, mode = "val_loss", "min"
             callbacks.append(
                 EarlyStoppingCallback(
                     monitor=monitor,

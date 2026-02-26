@@ -31,8 +31,17 @@ data/
 data_cache/
 uploads/
 cache/
+checkpoints/
+output_detection/
+output_detection_full/
+notebooks/
 *.db
 *.sqlite3
+
+# Experiments (datasets & results are large)
+experiments/datasets/
+experiments/results/
+experiments/results_modal/
 
 # Frontend
 frontend/node_modules/
@@ -50,3 +59,12 @@ wandb/
 # Environment
 .env
 .env.local
+
+# Photos
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.svg
+*.ico

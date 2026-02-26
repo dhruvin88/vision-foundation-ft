@@ -17,7 +17,7 @@ router = APIRouter(prefix="/api/projects/{project_id}/training", tags=["training
 
 
 class TrainingConfig(BaseModel):
-    encoder_name: str = "dinov2_vitb14"
+    encoder_name: str = "dinov3_vitb16"
     decoder_name: str = "auto"
     num_classes: int = 2
     learning_rate: float = 1e-3
@@ -59,8 +59,8 @@ async def start_training(
         raise HTTPException(status_code=404, detail="Project not found")
 
     # Validate encoder name
-    from core.encoders.dinov2 import ALL_VARIANTS
-    if config.encoder_name not in ALL_VARIANTS:
+    from core.encoders import ALL_ENCODER_VARIANTS
+    if config.encoder_name not in ALL_ENCODER_VARIANTS:
         raise HTTPException(
             status_code=400,
             detail=f"Unknown encoder: {config.encoder_name}",

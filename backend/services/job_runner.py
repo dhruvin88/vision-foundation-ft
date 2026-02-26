@@ -122,7 +122,7 @@ async def _run_training(run_id: int, session_factory) -> None:
 
 def _train_sync(run_id: int, config: dict) -> dict:
     """Synchronous training function (runs in executor)."""
-    from core.encoders.dinov2 import DINOv2Encoder
+    from core.encoders import create_encoder
     from core.data.dataset import FFTDataset
     from core.training.trainer import Trainer
     from core.cli import _create_decoder
@@ -131,7 +131,7 @@ def _train_sync(run_id: int, config: dict) -> dict:
 
     # Load encoder
     _job_progress[run_id]["status"] = "loading_encoder"
-    encoder = DINOv2Encoder(config["encoder_name"])
+    encoder = create_encoder(config["encoder_name"])
 
     # Create decoder
     decoder = _create_decoder(

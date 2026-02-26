@@ -82,12 +82,12 @@ async def run_inference(
             image_paths.append(temp_path)
 
         # Load model and run inference
-        from core.encoders.dinov2 import DINOv2Encoder
+        from core.encoders import create_encoder
         from core.evaluation.inference import run_inference as _run_inference
         from core.export.weights import load_decoder_weights
         from core.cli import _create_decoder
 
-        encoder = DINOv2Encoder(run.encoder_name)
+        encoder = create_encoder(run.encoder_name)
         # Determine task from project
         from backend.db.models import Project
         project = session.get(Project, project_id)

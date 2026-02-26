@@ -51,14 +51,14 @@ def health_check():
 @app.get("/api/encoders")
 def list_encoders():
     """List available encoder models."""
-    from core.encoders.dinov2 import ALL_VARIANTS
+    from core.encoders import ALL_ENCODER_VARIANTS
     return {
         name: {
             "embed_dim": config["embed_dim"],
             "patch_size": config["patch_size"],
             "num_heads": config["num_heads"],
         }
-        for name, config in ALL_VARIANTS.items()
+        for name, config in ALL_ENCODER_VARIANTS.items()
     }
 
 
