@@ -7,23 +7,24 @@ FFT follows a **frozen encoder + lightweight decoder** pattern. Large pretrained
 ## System Overview
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                        Interfaces                            │
-│  ┌──────────┐    ┌──────────────┐    ┌───────────────────┐   │
-│  │   CLI    │    │  Python SDK  │    │  REST API (FastAPI)│   │
-│  └────┬─────┘    └──────┬───────┘    └────────┬──────────┘   │
-│       └─────────────────┼─────────────────────┘              │
-│                         ▼                                    │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │                    Core Library                       │    │
-│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌────────┐  │    │
-│  │  │ Encoders │ │ Decoders │ │ Training │ │  Data  │  │    │
-│  │  └──────────┘ └──────────┘ └──────────┘ └────────┘  │    │
-│  │  ┌────────────┐ ┌────────┐                           │    │
-│  │  │ Evaluation │ │ Export │                           │    │
-│  │  └────────────┘ └────────┘                           │    │
-│  └──────────────────────────────────────────────────────┘    │
-└──────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                           Interfaces                                 │
+│  ┌──────────┐  ┌──────────────┐  ┌───────────────┐  ┌───────────┐  │
+│  │   CLI    │  │  Python SDK  │  │ REST API      │  │ Streamlit │  │
+│  │ fft ...  │  │  import sdk  │  │ FastAPI/uvicorn│  │ frontend/ │  │
+│  └────┬─────┘  └──────┬───────┘  └───────┬───────┘  └─────┬─────┘  │
+│       └───────────────┼─────────────────┬┘                │        │
+│                       ▼                 ▼                  │        │
+│  ┌────────────────────────────────────────────────────┐   │        │
+│  │                    Core Library                     │ ◄─┘        │
+│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌────────┐ │            │
+│  │  │ Encoders │ │ Decoders │ │ Training │ │  Data  │ │            │
+│  │  └──────────┘ └──────────┘ └──────────┘ └────────┘ │            │
+│  │  ┌────────────┐ ┌────────┐                          │            │
+│  │  │ Evaluation │ │ Export │                          │            │
+│  │  └────────────┘ └────────┘                          │            │
+│  └────────────────────────────────────────────────────┘            │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Core Modules
@@ -41,6 +42,25 @@ All encoders inherit from `BaseEncoder` and provide:
 - **DINOv2Encoder**: Loads from `torch.hub` (`facebookresearch/dinov2`). Variants: vits14, vitb14, vitl14, vitg14 (+ `_reg`). Patch size 14, default input 518×518.
 
 All parameters are frozen immediately after loading. Use `create_encoder(model_name)` factory to instantiate.
+
+#### LoRA (`core/encoders/lora.py`)
+
+When frozen features are insufficient, LoRA adapters can be injected into the encoder's attention layers:
+
+```python
+encoder.enable_lora(rank=4, alpha=4.0, target_modules=["attn.qkv", "attn.proj"])
+```
+
+`apply_lora()` replaces each target `nn.Linear` with a `LoRALinear` wrapper:
+
+```
+output = W·x + (alpha/rank) · B(A(x))
+```
+
+- `W` stays frozen; only `A` (rank×in) and `B` (out×rank) are trained.
+- `B` is initialized to zeros, so LoRA starts as an identity transformation.
+- The encoder's `_fwd_ctx` property returns `contextlib.nullcontext()` when LoRA is active (so gradients flow) and `torch.no_grad()` otherwise.
+- `DecoderLightningModule` re-enables LoRA parameters after calling `encoder.freeze()` to ensure they keep `requires_grad=True`.
 
 #### Encoder Feature Flow
 
@@ -125,6 +145,16 @@ Encoder features['cls_token']  (B, D)
 #### Detection Decoders
 
 Take **spatial/patch features** and output bounding boxes + class logits.
+
+**RTDETRDecoder** (default, multi-scale):
+
+See [rtdetr.md](rtdetr.md) for a full architecture walkthrough. Summary:
+- Fuses 3-scale ViT intermediate features with a parallel CNN branch (SpatialPriorModule)
+- Applies a HybridEncoder (transformer on coarsest scale + FPN top-down)
+- Top-k proposal initialization warm-starts object queries from high-scoring encoder positions
+- 4 decoder layers with iterative box refinement
+- Varifocal loss (VFL) + L1 + GIoU for classification and localization
+- Contrastive denoising (CDN) during training for additional supervised signal
 
 **DETRLite** (single-scale, transformer-based):
 ```
@@ -264,7 +294,20 @@ Augmentation presets (`none`, `light`, `heavy`) use Albumentations for task-awar
 - Early stopping
 - Checkpoint management
 
+**Training modes:**
+- `"standard"` (default): Standard training loop.
+- `"deim"`: Detection-focused. Wraps the dataset with `MosaicDetectionDataset` (4-image grid stitching, disabled at `epoch >= total_epochs * 0.5`) and disables CDN in the final 2 epochs.
+
 `DecoderLightningModule` handles the training loop, loss computation, and metric tracking per task.
+
+**Loss routing** (detection):
+- If the prediction dict contains `"enc_outputs"` (RTDETRDecoder output), the full RT-DETR loss is used: VFL + L1 + GIoU on final layer, same losses on all 4 aux layers (reusing same Hungarian matches), encoder auxiliary BCE, and CDN loss if CDN outputs are present.
+- Otherwise (DETRLiteDecoder), the DETR loss is used: Hungarian matching + CrossEntropy (with `eos_coef=0.1` for no-object) + L1 + GIoU.
+
+**Validation metrics:**
+- Classification: `val_acc` (logged per epoch)
+- Detection: `val_map50` and `val_map` via `torchmetrics.detection.MeanAveragePrecision`
+- Segmentation: `val_loss` (cross-entropy)
 
 ### Evaluation (`core/evaluation/`)
 
@@ -280,24 +323,52 @@ Augmentation presets (`none`, `light`, `heavy`) use Albumentations for task-awar
 
 FastAPI application providing a REST API for project management, dataset upload, training job control, and real-time progress via WebSocket.
 
-**Database**: SQLModel with SQLite (configurable). Models: `Project`, `ImageRecord`, `Annotation`, `TrainingRun`.
+**Database**: SQLModel with SQLite (configurable). Models: `Project`, `ImageRecord`, `Annotation`, `TrainingRun`. Database is created at `./data/app.db` on startup via `on_startup`.
 
-**Services**:
+**Routes** (`backend/api/`):
+- `projects.py`: CRUD for training projects
+- `datasets.py`: Dataset upload and management
+- `training.py`: Start/stop/monitor training jobs
+- `models.py`: Model listing and download
+
+**Services** (`backend/services/`):
 - `storage.py`: File management for images, thumbnails, models
 - `job_runner.py`: Background training job execution
-- `websocket.py`: Real-time training progress updates
+- `websocket.py`: Real-time training progress updates via WebSocket
+
+**Note:** The `/api/decoders` endpoint does not yet list `rtdetr` — it reflects an older decoder set. The CLI and SDK are the authoritative sources for available decoder names.
+
+## Frontend (`frontend/`)
+
+Streamlit application with a 5-page pipeline:
+
+```
+app.py              # Entry point, sidebar navigation, task selection
+pages/
+  1_Dataset.py     # Dataset path/upload configuration
+  2_Model.py       # Encoder and decoder selection
+  3_Training.py    # Training parameter configuration and job launch
+  4_Results.py     # Loss curves and metric display
+  5_Inference.py   # Run predictions on uploaded images
+```
+
+Start with: `streamlit run frontend/app.py`
 
 ## Key Design Decisions
 
-1. **Frozen encoders**: Encoder weights are never modified. This reduces memory usage (no gradients stored for encoder params) and preserves the quality of pretrained features.
+1. **Frozen encoders**: Encoder weights are never modified by default. This reduces memory usage (no gradients stored for encoder params) and preserves the quality of pretrained features.
 
-2. **Feature dict interface**: Encoders return a dictionary of features (`cls_token`, `patch_tokens`, `spatial_features`). Decoders select which features they need, making the interface flexible without coupling.
+2. **LoRA as an opt-in escape hatch**: When frozen features are insufficient, `lora_rank > 0` injects trainable low-rank adapters into attention layers. The encoder stays structurally frozen; only the LoRA parameters (A, B matrices) are trained. This avoids full fine-tuning while still allowing adaptation.
 
-3. **PyTorch Lightning**: Training uses Lightning for distributed training support, mixed precision, logging, and checkpointing without custom boilerplate.
+3. **Feature dict interface**: Encoders return a dictionary of features (`cls_token`, `patch_tokens`, `spatial_features`, optional `intermediate`). Decoders select which keys they need, making the interface flexible without coupling encoder to decoder.
 
-4. **Multiple interfaces**: The same core library is accessible via Python SDK (for notebooks/scripts), CLI (for shell workflows), and REST API (for web applications).
+4. **RTDETRDecoder as the default detection head**: RT-DETR converges in 20–30 epochs vs. 50–100 for vanilla DETR, due to warm-start query initialization and better loss (VFL over cross-entropy). This is the default for `DetectionHead()` and `fft train --task detection`.
 
-5. **Lightweight weight files**: Only decoder weights are saved (typically <50MB), not the large encoder weights (which are loaded from HuggingFace/torch.hub cache).
+5. **PyTorch Lightning**: Training uses Lightning for distributed training support, mixed precision, logging, and checkpointing without custom boilerplate.
+
+6. **Multiple interfaces**: The same core library is accessible via Python SDK (for notebooks/scripts), CLI (for shell workflows), REST API (for web applications), and Streamlit UI (for interactive browser-based use).
+
+7. **Lightweight weight files**: Only decoder weights are saved (typically <50 MB), not the large encoder weights (which are loaded from HuggingFace/torch.hub cache on demand).
 
 ## Complete Training Flow
 
@@ -309,13 +380,17 @@ FastAPI application providing a REST API for project management, dataset upload,
          │
          ▼
 ┌─────────────────────────────────────────────┐
-│  Frozen Encoder (DINOv3/DINOv2)             │
+│  Encoder (DINOv3/DINOv2)                    │
 │  ┌────────────────────────────────────────┐ │
 │  │  Patch Embedding → Transformer Blocks  │ │
 │  │  → Layer Norm                          │ │
+│  │                                        │ │
+│  │  [Optional] LoRA adapters on attn      │ │
+│  │  layers: output += (α/r)·B(A(x))       │ │
 │  └────────────────────────────────────────┘ │
 │                                             │
-│  No gradients computed (frozen params)      │
+│  Frozen params: no gradients                │
+│  LoRA params (if enabled): gradients flow   │
 └─────────────────┬───────────────────────────┘
                   │
                   ▼
@@ -347,20 +422,21 @@ FastAPI application providing a REST API for project management, dataset upload,
 ┌─────────────────────────────────────────────┐
 │  Loss Computation                           │
 │  • CrossEntropy (classification)            │
-│  • Hungarian + L1 + GIoU (DETR detection)   │
-│  • Focal Loss (FPN detection)               │
+│  • RT-DETR: VFL + L1 + GIoU + CDN + aux    │
+│  • DETRLite: Hungarian + CE + L1 + GIoU     │
 │  • CrossEntropy (segmentation)              │
 └─────────────────┬───────────────────────────┘
                   │
                   ▼
          Backprop through decoder only
+         (+ LoRA params if enabled)
                   │
                   ▼
 ┌─────────────────────────────────────────────┐
 │  Optimizer Step (AdamW)                     │
 │  • LR scheduler (warmup + cosine/step)      │
-│  • Updates only decoder params              │
+│  • Updates decoder params + LoRA (if on)    │
 └─────────────────────────────────────────────┘
 ```
 
-**Memory efficiency**: Since encoder gradients are never computed, GPU memory usage is dominated by decoder activations and optimizer states. A 1B-parameter encoder + 10M-parameter decoder uses similar memory to training a 10M-parameter model from scratch.
+**Memory efficiency**: Since encoder gradients are never computed (in standard mode), GPU memory usage is dominated by decoder activations and optimizer states. A 1B-parameter encoder + 10M-parameter decoder uses similar memory to training a 10M-parameter model from scratch. With LoRA, a small additional overhead is incurred for the LoRA A/B parameters and their gradients.

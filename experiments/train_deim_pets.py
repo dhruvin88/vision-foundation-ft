@@ -1,7 +1,11 @@
-"""DEIM + LoRA training on Oxford-IIIT Pets (mask-derived boxes).
+"""Frozen-encoder training on Oxford-IIIT Pets (mask-derived boxes).
 
-dinov2_vits14 + RTDETRDecoder + LoRA rank=4, training_mode="deim".
-Results saved to experiments/results/deim_pets_lora/.
+dinov2_vits14 + RTDETRDecoder, no LoRA.
+  - num_queries=10   (Oxford Pets = 1 object/image, 10 queries is sufficient)
+  - num_decoder_layers=6  (was 4)
+  - dim_feedforward=2048  (was 1024)
+  - deeper cls_head (3-layer MLP)
+Results saved to experiments/results/deim_pets_no_lora/.
 """
 
 import json
@@ -11,20 +15,22 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-DATA_DIR  = Path(__file__).parent / "datasets" / "oxford_pets"
-OUT_DIR   = Path(__file__).parent / "results" / "deim_pets_lora"
-EPOCHS    = 60
-BATCH     = 8
-LR        = 1e-4
-WORKERS   = 0
-LORA_RANK = 4
+DATA_DIR          = Path(__file__).parent / "datasets" / "oxford_pets"
+OUT_DIR           = Path(__file__).parent / "results" / "deim_pets_no_lora"
+EPOCHS            = 60
+BATCH             = 8
+LR                = 1e-4
+WORKERS           = 0
+NUM_QUERIES       = 10
+NUM_DEC_LAYERS    = 6
+DIM_FEEDFORWARD   = 2048
 
 
 def main():
     from core.encoders import create_encoder
     from core.data.dataset import FFTDataset
     from core.training.trainer import Trainer
-    from core.cli import _create_decoder
+    from core.decoders.rtdetr import RTDETRDecoder
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -33,17 +39,26 @@ def main():
     num_classes = len(meta["categories"])
 
     print("=" * 60)
-    print("DEIM + LoRA - Oxford-IIIT Pets (mask -> bbox)")
-    print(f"  Classes:    {num_classes}")
-    print(f"  Epochs:     {EPOCHS}")
-    print(f"  Batch size: {BATCH}")
-    print(f"  LR:         {LR}")
-    print(f"  LoRA rank:  {LORA_RANK}")
+    print("Frozen encoder - Oxford-IIIT Pets (mask -> bbox)")
+    print(f"  Classes:         {num_classes}")
+    print(f"  Epochs:          {EPOCHS}")
+    print(f"  Batch size:      {BATCH}")
+    print(f"  LR:              {LR}")
+    print(f"  LoRA:            disabled")
+    print(f"  num_queries:     {NUM_QUERIES}")
+    print(f"  decoder_layers:  {NUM_DEC_LAYERS}")
+    print(f"  dim_feedforward: {DIM_FEEDFORWARD}")
     print("=" * 60)
 
     t0 = time.time()
-    encoder = create_encoder("dinov2_vits14", input_size=384)
-    decoder = _create_decoder("rtdetr", "detection", encoder, num_classes)
+    encoder = create_encoder("dinov2_vits14", input_size=378)
+    decoder = RTDETRDecoder(
+        encoder,
+        num_classes=num_classes,
+        num_queries=NUM_QUERIES,
+        num_decoder_layers=NUM_DEC_LAYERS,
+        dim_feedforward=DIM_FEEDFORWARD,
+    )
     print(f"Decoder trainable params: {decoder.num_trainable_params():,}")
 
     dataset = FFTDataset.from_folder(
@@ -64,7 +79,7 @@ def main():
         checkpoint_dir=OUT_DIR / "checkpoints",
         num_workers=WORKERS,
         training_mode="standard",
-        lora_rank=LORA_RANK,
+        lora_rank=0,
     )
 
     results = trainer.fit()

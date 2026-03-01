@@ -226,7 +226,7 @@ class RTDETRDecoderLayer(nn.Module):
         self.norm1 = nn.RMSNorm(hidden_dim)
         self.norm2 = nn.RMSNorm(hidden_dim)
         self.norm3 = nn.RMSNorm(hidden_dim)
-        self.cls_head = nn.Linear(hidden_dim, num_classes)
+        self.cls_head = _MLP(hidden_dim, hidden_dim, num_classes, num_layers=3)
         self.bbox_head = _MLP(hidden_dim, hidden_dim, 4, num_layers=2)
 
     def forward(
@@ -484,7 +484,7 @@ class RTDETRDecoder(BaseDecoder):
         scale_sizes: list[tuple[int, int]],
         device: torch.device,
     ) -> torch.Tensor:
-        key = tuple(scale_sizes)
+        key = (tuple(scale_sizes), device)
         if key not in self._anchors_cache:
             parts = []
             for h, w in scale_sizes:
@@ -498,8 +498,8 @@ class RTDETRDecoder(BaseDecoder):
                 bw = torch.full_like(cx, 1.0 / w)
                 bh = torch.full_like(cy, 1.0 / h)
                 parts.append(torch.stack([cx, cy, bw, bh], dim=-1).reshape(-1, 4))
-            self._anchors_cache[key] = torch.cat(parts, dim=0)
-        return self._anchors_cache[key].to(device)
+            self._anchors_cache[key] = torch.cat(parts, dim=0).to(device)
+        return self._anchors_cache[key]
 
     def forward(self, features: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         # --- 1. Get ViT intermediate features (3 scales) ---
