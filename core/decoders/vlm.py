@@ -217,6 +217,7 @@ class VLMDecoder(nn.Module):
             do_sample=False,
             pad_token_id=self.tokenizer.pad_token_id,
             eos_token_id=self.tokenizer.eos_token_id,
+            use_cache=False,
         )
         return self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
 
