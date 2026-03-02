@@ -41,7 +41,7 @@ def main() -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     print("=" * 60)
-    print("VLM Fine-tuning: DINOv2 + Phi-3.5-mini on Oxford Pets")
+    print("VLM Fine-tuning: DINOv2 + TinyLlama-1.1B on Oxford Pets")
     print(f"  Stage 1: projector alignment  ({S1_EPOCHS} epochs, lr={S1_LR})")
     print(f"  Stage 2: instruction tuning   ({S2_EPOCHS} epochs, lr={S2_LR}, LoRA rank={S2_LORA_RANK})")
     print("=" * 60)
@@ -53,7 +53,8 @@ def main() -> None:
     decoder = VLMDecoder(encoder, freeze_llm=True, lora_rank=0, pool_patches=2)
 
     print(f"\nEncoder:           dinov2_vits14 (embed_dim={encoder.embed_dim})")
-    print(f"Visual tokens:     {decoder.num_visual_tokens}  (16×16 → 8×8 after 2×2 pool)")
+    print(f"LLM:               TinyLlama-1.1B-Chat-v1.0")
+    print(f"Visual tokens:     {decoder.num_visual_tokens}  (16x16 -> 8x8 after 2x2 pool)")
     print(f"Projector params:  {sum(p.numel() for p in decoder.projector.parameters()):,}")
     print(f"LLM total params:  {sum(p.numel() for p in decoder.llm.parameters()):,}")
 
@@ -69,7 +70,7 @@ def main() -> None:
     )
     train_ds, val_ds = dataset.split()
 
-    print(f"\nDataset: {len(dataset)} total → {len(train_ds)} train / {len(val_ds)} val")
+    print(f"\nDataset: {len(dataset)} total -> {len(train_ds)} train / {len(val_ds)} val")
 
     # ── Stage 1: Projector alignment ──────────────────────────────────────────
     print("\n" + "─" * 60)

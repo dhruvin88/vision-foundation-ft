@@ -38,10 +38,11 @@ class VLMDecoder(nn.Module):
     def __init__(
         self,
         encoder: BaseEncoder,
-        llm_name: str = "microsoft/Phi-3.5-mini-instruct",
+        llm_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
         freeze_llm: bool = True,
         lora_rank: int = 0,
         pool_patches: int = 2,
+        load_in_4bit: bool = False,
     ) -> None:
         super().__init__()
         self.encoder = encoder
@@ -50,7 +51,7 @@ class VLMDecoder(nn.Module):
         embed_dim = encoder.embed_dim
 
         logger.info("Loading tokenizer + LLM: %s", llm_name)
-        from transformers import AutoTokenizer, AutoModelForCausalLM
+        from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             llm_name, trust_remote_code=True
@@ -58,10 +59,22 @@ class VLMDecoder(nn.Module):
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
+        bnb_config = None
+        if load_in_4bit:
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+            )
+            logger.info("Loading LLM in 4-bit NF4 quantization")
+
         self.llm = AutoModelForCausalLM.from_pretrained(
             llm_name,
-            torch_dtype=torch.bfloat16,
+            quantization_config=bnb_config,
+            dtype=torch.bfloat16 if not load_in_4bit else None,
             trust_remote_code=True,
+            device_map="cuda:0" if (load_in_4bit and torch.cuda.is_available()) else None,
         )
 
         llm_dim: int = self.llm.config.hidden_size
@@ -115,9 +128,10 @@ class VLMDecoder(nn.Module):
         pooled = F.avg_pool2d(spatial, kernel_size=self.pool_patches)    # (B, D, h', w')
         pooled = pooled.flatten(2).transpose(1, 2)                       # (B, N', D)
 
-        # Project: cast to projector dtype, then to LLM dtype
+        # Project: cast to projector dtype, then to LLM compute dtype.
+        # Use the embedding layer dtype (not raw param dtype, which is uint8 for 4-bit quant).
         proj_dtype = self.projector[0].weight.dtype
-        llm_dtype = next(self.llm.parameters()).dtype
+        llm_dtype = self.llm.get_input_embeddings().weight.dtype
 
         visual_tokens = self.projector(pooled.to(proj_dtype))   # (B, N', llm_dim)
         return visual_tokens.to(llm_dtype)
@@ -163,6 +177,7 @@ class VLMDecoder(nn.Module):
             inputs_embeds=combined,
             attention_mask=full_mask,
             labels=full_labels,
+            use_cache=False,
         )
         return {"loss": output.loss, "logits": output.logits}
 
