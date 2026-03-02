@@ -27,7 +27,7 @@ Thumbs.db
 *.pth
 *.onnx
 *.ckpt
-data/
+/data/
 data_cache/
 uploads/
 cache/

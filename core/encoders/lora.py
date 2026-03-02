@@ -25,7 +25,8 @@ class LoRALinear(nn.Module):
         nn.init.zeros_(self.lora_B.weight)
 
     def forward(self, x):
-        return self.linear(x) + self.scale * self.lora_B(self.lora_A(x))
+        lora_out = self.lora_B(self.lora_A(x.to(self.lora_A.weight.dtype)))
+        return self.linear(x) + self.scale * lora_out.to(x.dtype)
 
 
 def apply_lora(
