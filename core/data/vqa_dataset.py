@@ -150,9 +150,9 @@ class PetsVQADataset(Dataset):
         template_fn = random.choice(_QA_TEMPLATES)
         question, answer = template_fn(breed, species, region)
 
-        # TinyLlama / Zephyr chat format
-        question_text = f"<|user|>\n{question}</s>\n<|assistant|>\n"
-        answer_text = f"{answer}</s>"
+        # Phi-3.5-mini native chat format
+        question_text = f"<|user|>\n{question}<|end|>\n<|assistant|>\n"
+        answer_text = f"{answer}<|end|>"
         full_text = question_text + answer_text
 
         # Tokenize the full sequence (question + answer)

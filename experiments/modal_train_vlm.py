@@ -187,7 +187,7 @@ def train_vlm(
             features = encoder.forward_features(image_t.to(device))
         q = "What breed of animal is in this image?"
         enc = decoder.tokenizer(
-            f"<|user|>\n{q}</s>\n<|assistant|>\n", return_tensors="pt"
+            f"<|user|>\n{q}<|end|>\n<|assistant|>\n", return_tensors="pt"
         )
         answers = decoder.generate(
             features, enc["input_ids"].to(device),

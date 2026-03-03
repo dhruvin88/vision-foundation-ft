@@ -30,6 +30,7 @@ dependencies = [
     "tqdm>=4.65.0",
     "pyyaml>=6.0",
     "transformers>=4.50.0",
+    "bitsandbytes>=0.41.0",
 ]
 
 [project.optional-dependencies]

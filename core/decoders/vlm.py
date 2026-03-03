@@ -193,6 +193,7 @@ class VLMDecoder(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         max_new_tokens: int = 128,
+        **kwargs,
     ) -> list[str]:
         """Greedy decode for inference.
 
@@ -201,19 +202,24 @@ class VLMDecoder(nn.Module):
             input_ids: Question token ids (B, T).
             attention_mask: Question attention mask (B, T).
             max_new_tokens: Maximum tokens to generate.
+            **kwargs: Additional arguments forwarded to llm.generate() (e.g. eos_token_id).
 
         Returns:
             List of decoded answer strings (length B).
         """
         combined, full_mask = self._prepare_inputs(features, input_ids, attention_mask)
 
+        generate_kwargs = {
+            "do_sample": False,
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "eos_token_id": self.tokenizer.eos_token_id,
+            **kwargs,
+        }
         generated_ids = self.llm.generate(
             inputs_embeds=combined,
             attention_mask=full_mask,
             max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=self.tokenizer.pad_token_id,
-            eos_token_id=self.tokenizer.eos_token_id,
+            **generate_kwargs,
         )
         return self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
 
