@@ -53,9 +53,7 @@ class VLMDecoder(nn.Module):
         logger.info("Loading tokenizer + LLM: %s", llm_name)
         from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            llm_name, trust_remote_code=True
-        )
+        self.tokenizer = AutoTokenizer.from_pretrained(llm_name)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
@@ -73,7 +71,6 @@ class VLMDecoder(nn.Module):
             llm_name,
             quantization_config=bnb_config,
             dtype=torch.bfloat16 if not load_in_4bit else None,
-            trust_remote_code=True,
             device_map="cuda:0" if (load_in_4bit and torch.cuda.is_available()) else None,
         )
 
@@ -136,6 +133,26 @@ class VLMDecoder(nn.Module):
         visual_tokens = self.projector(pooled.to(proj_dtype))   # (B, N', llm_dim)
         return visual_tokens.to(llm_dtype)
 
+    def _prepare_inputs(
+        self,
+        features: dict[str, torch.Tensor],
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode visual tokens, embed text, and concatenate for LLM input.
+
+        Returns:
+            combined: (B, V+T, llm_dim) input embeddings.
+            full_mask: (B, V+T) attention mask.
+        """
+        visual_tokens = self._encode_visual(features)   # (B, V, llm_dim)
+        B, V, _ = visual_tokens.shape
+        text_embeds = self.llm.get_input_embeddings()(input_ids).to(dtype=visual_tokens.dtype)
+        combined = torch.cat([visual_tokens, text_embeds], dim=1)
+        visual_mask = torch.ones(B, V, dtype=attention_mask.dtype, device=visual_tokens.device)
+        full_mask = torch.cat([visual_mask, attention_mask], dim=1)
+        return combined, full_mask
+
     def forward(
         self,
         features: dict[str, torch.Tensor],
@@ -154,23 +171,11 @@ class VLMDecoder(nn.Module):
         Returns:
             Dict with 'loss' (scalar) and 'logits' (B, V+T, vocab_size).
         """
-        visual_tokens = self._encode_visual(features)   # (B, V, llm_dim)
-        B, V, _ = visual_tokens.shape
-        device = visual_tokens.device
-
-        # Embed text using the standard HuggingFace interface (works for all LLMs)
-        text_embeds = self.llm.get_input_embeddings()(input_ids)   # (B, T, llm_dim)
-        text_embeds = text_embeds.to(dtype=visual_tokens.dtype)
-
-        # Concatenate [visual | text]
-        combined = torch.cat([visual_tokens, text_embeds], dim=1)  # (B, V+T, llm_dim)
-
-        # Extend attention mask with ones for visual positions
-        visual_mask = torch.ones(B, V, dtype=attention_mask.dtype, device=device)
-        full_mask = torch.cat([visual_mask, attention_mask], dim=1)  # (B, V+T)
+        combined, full_mask = self._prepare_inputs(features, input_ids, attention_mask)
+        B, V = combined.shape[0], self.num_visual_tokens
 
         # Prepend -100 labels for visual positions (ignored in loss)
-        visual_labels = torch.full((B, V), -100, dtype=labels.dtype, device=device)
+        visual_labels = torch.full((B, V), -100, dtype=labels.dtype, device=combined.device)
         full_labels = torch.cat([visual_labels, labels], dim=1)     # (B, V+T)
 
         output = self.llm(
@@ -200,15 +205,7 @@ class VLMDecoder(nn.Module):
         Returns:
             List of decoded answer strings (length B).
         """
-        visual_tokens = self._encode_visual(features)   # (B, V, llm_dim)
-        B, V, _ = visual_tokens.shape
-        device = visual_tokens.device
-
-        text_embeds = self.llm.get_input_embeddings()(input_ids).to(dtype=visual_tokens.dtype)
-        combined = torch.cat([visual_tokens, text_embeds], dim=1)
-
-        visual_mask = torch.ones(B, V, dtype=attention_mask.dtype, device=device)
-        full_mask = torch.cat([visual_mask, attention_mask], dim=1)
+        combined, full_mask = self._prepare_inputs(features, input_ids, attention_mask)
 
         generated_ids = self.llm.generate(
             inputs_embeds=combined,
@@ -217,7 +214,6 @@ class VLMDecoder(nn.Module):
             do_sample=False,
             pad_token_id=self.tokenizer.pad_token_id,
             eos_token_id=self.tokenizer.eos_token_id,
-            use_cache=False,
         )
         return self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
 
