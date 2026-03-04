@@ -154,7 +154,7 @@ class ProposalNetwork(nn.Module):
     def __init__(self, hidden_dim: int, num_classes: int, num_queries: int) -> None:
         super().__init__()
         self.num_queries = num_queries
-        self.score_head = nn.Linear(hidden_dim, num_classes)
+        self.score_head = _MLP(hidden_dim, hidden_dim, num_classes, num_layers=3)
         self.bbox_head = _MLP(hidden_dim, hidden_dim, 4, num_layers=2)
 
     def forward(
