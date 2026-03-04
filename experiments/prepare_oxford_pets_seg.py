@@ -35,8 +35,9 @@ def main() -> None:
     masks_dir  = OUT_DIR / "masks"
     images_dir = OUT_DIR / "images"
 
-    if masks_dir.exists() and len(list(masks_dir.glob("*.png"))) > 100:
-        print(f"Already prepared: {len(list(masks_dir.glob('*.png')))} masks in {masks_dir}")
+    existing = list(masks_dir.glob("*.png")) if masks_dir.exists() else []
+    if len(existing) > 100:
+        print(f"Already prepared: {len(existing)} masks in {masks_dir}")
         return
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)

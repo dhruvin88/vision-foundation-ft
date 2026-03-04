@@ -10,7 +10,7 @@ Usage:
     modal run experiments/modal_train_seg.py::upload_dataset
 
     # Run training:
-    modal run --detach experiments/modal_train_seg.py
+    modal run --detach experiments/modal_train_seg.py::main
 
     # Download results:
     modal volume get fft-results /seg_pets ./experiments/results_modal/seg_pets
@@ -22,21 +22,14 @@ from pathlib import Path
 
 import modal
 
+from experiments.modal_utils import modal_ignore
+
 ROOT = Path(__file__).parent.parent
 
 # ── Persistent Modal volumes ──────────────────────────────────────────────────
 dataset_vol = modal.Volume.from_name("fft-datasets",  create_if_missing=True)
 results_vol = modal.Volume.from_name("fft-results",   create_if_missing=True)
 hub_vol     = modal.Volume.from_name("fft-hub-cache", create_if_missing=True)
-
-
-def _ignore(path: Path) -> bool:
-    parts    = set(path.parts)
-    path_str = path.as_posix()
-    return bool(parts & {".venv", "__pycache__", ".git", ".pytest_cache", "checkpoints"}) or \
-           any(s in path_str for s in ["experiments/datasets", "experiments/results",
-                                        "experiments/results_modal"])
-
 
 image = (
     modal.Image.from_registry(
@@ -53,7 +46,7 @@ image = (
         "scipy>=1.10",
         "tqdm>=4.65.0",
     )
-    .add_local_dir(ROOT, remote_path="/app", ignore=_ignore)
+    .add_local_dir(ROOT, remote_path="/app", ignore=modal_ignore)
 )
 
 app = modal.App("fft-seg", image=image)
@@ -87,22 +80,19 @@ def train_seg(
     import sys
     import time
 
-    import numpy as np
-    import torch
-    from PIL import Image
-
     sys.path.insert(0, "/app")
 
     from core.encoders import create_encoder
+    from core.data.dataset import FFTDataset
     from core.decoders.segmentation import UPerNetHead
     from core.training.trainer import Trainer
 
-    data_dir   = Path("/datasets/oxford_pets_seg")
-    out_dir    = Path("/results/seg_pets")
+    data_dir = Path("/datasets/oxford_pets_seg")
+    out_dir  = Path("/results/seg_pets")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 60)
-    print(f"Segmentation Training: DINOv2 + UPerNetHead")
+    print("Segmentation Training: DINOv2 + UPerNetHead")
     print(f"  Encoder:     {encoder_name}")
     print(f"  num_classes: {num_classes}  (0=bg, 1=pet, 2=boundary)")
     print(f"  input_size:  {input_size}")
@@ -110,62 +100,26 @@ def train_seg(
     print(f"  LoRA rank:   {lora_rank}")
     print("=" * 60)
 
-    # ── Dataset ────────────────────────────────────────────────────────────────
-    class SegDatasetWithResize:
-        def __init__(self, samples, transform, output_size):
-            self.samples     = samples
-            self.transform   = transform
-            self.output_size = output_size
-
-        def __len__(self):
-            return len(self.samples)
-
-        def __getitem__(self, idx):
-            s     = self.samples[idx]
-            image = Image.open(s["image_path"]).convert("RGB")
-            mask  = Image.open(s["mask_path"])
-            if self.transform:
-                image = self.transform(image)
-            mask  = mask.resize((self.output_size, self.output_size), Image.NEAREST)
-            mask  = torch.from_numpy(np.array(mask, dtype=np.int64))
-            return {"image": image, "mask": mask}
-
-    images_dir = data_dir / "images"
-    masks_dir  = data_dir / "masks"
-    samples    = []
-    for img_path in sorted(images_dir.iterdir()):
-        if img_path.suffix.lower() in {".jpg", ".jpeg", ".png"}:
-            mask_path = masks_dir / f"{img_path.stem}.png"
-            if mask_path.exists():
-                samples.append({"image_path": str(img_path), "mask_path": str(mask_path)})
-    print(f"Dataset: {len(samples)} image/mask pairs")
-
-    encoder = create_encoder(encoder_name, input_size=input_size)
-
-    rng     = np.random.RandomState(42)
-    indices = rng.permutation(len(samples))
-    val_n   = int(len(indices) * 0.2)
-    train_samples = [samples[i] for i in indices[val_n:]]
-    val_samples   = [samples[i] for i in indices[:val_n]]
-
-    transform = encoder.get_transform()
-    train_ds  = SegDatasetWithResize(train_samples, transform, input_size)
-    val_ds    = SegDatasetWithResize(val_samples,   transform, input_size)
+    encoder   = create_encoder(encoder_name, input_size=input_size)
+    dataset   = FFTDataset.from_folder(
+        data_dir,
+        task="segmentation",
+        transform=encoder.get_transform(),
+        output_size=input_size,
+    )
+    print(f"Dataset: {len(dataset)} image/mask pairs")
+    train_ds, val_ds = dataset.split()
     print(f"  Train: {len(train_ds)}  Val: {len(val_ds)}")
 
-    # ── Model ──────────────────────────────────────────────────────────────────
     decoder = UPerNetHead(
         encoder,
         num_classes=num_classes,
         fpn_channels=fpn_channels,
         output_size=input_size,
     )
-    if lora_rank > 0:
-        encoder.enable_lora(rank=lora_rank)
     print(f"Decoder trainable params: {decoder.num_trainable_params():,}")
 
-    # ── Training ───────────────────────────────────────────────────────────────
-    t0 = time.time()
+    t0      = time.time()
     trainer = Trainer(
         decoder=decoder,
         train_dataset=train_ds,
@@ -179,7 +133,7 @@ def train_seg(
         checkpoint_dir=out_dir / "checkpoints",
         num_workers=num_workers,
         training_mode="standard",
-        lora_rank=lora_rank,
+        lora_rank=lora_rank,   # Trainer handles enable_lora() internally
     )
     results = trainer.fit()
     elapsed = time.time() - t0
@@ -237,15 +191,15 @@ def main(
 
     Examples:
         # Default (30 epochs, LoRA rank=4):
-        modal run --detach experiments/modal_train_seg.py
+        modal run --detach experiments/modal_train_seg.py::main
 
         # Quick smoke-test (3 epochs):
-        modal run experiments/modal_train_seg.py -- --epochs 3
+        modal run experiments/modal_train_seg.py::main -- --epochs 3
 
         # Larger encoder:
-        modal run --detach experiments/modal_train_seg.py -- --encoder dinov2_vitb14
+        modal run --detach experiments/modal_train_seg.py::main -- --encoder dinov2_vitb14
     """
-    print(f"Submitting segmentation job to Modal A10G:")
+    print("Submitting segmentation job to Modal A10G:")
     print(f"  Encoder:    {encoder}")
     print(f"  Epochs:     {epochs}, batch={batch_size}, lr={lr}")
     print(f"  LoRA rank:  {lora_rank}")

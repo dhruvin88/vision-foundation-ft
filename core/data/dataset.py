@@ -39,12 +39,14 @@ class FFTDataset(Dataset):
         transform=None,
         target_transform=None,
         class_names: list[str] | None = None,
+        output_size: int | None = None,
     ) -> None:
         self.samples = samples
         self.task = task
         self.transform = transform
         self.target_transform = target_transform
         self.class_names = class_names or []
+        self.output_size = output_size  # if set, segmentation masks are resized to this square size
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -91,11 +93,15 @@ class FFTDataset(Dataset):
         elif self.task == "segmentation":
             mask_path = sample.get("mask_path")
             if mask_path:
-                mask = np.array(Image.open(mask_path))
+                mask_img = Image.open(mask_path)
+                if self.output_size is not None:
+                    mask_img = mask_img.resize(
+                        (self.output_size, self.output_size), Image.NEAREST
+                    )
+                mask = np.array(mask_img)
             else:
-                mask = np.zeros(
-                    (image.size[1], image.size[0]), dtype=np.int64
-                )
+                sz = self.output_size or image.size[0]
+                mask = np.zeros((sz, sz), dtype=np.int64)
 
             if self.transform:
                 image = self.transform(image)
@@ -230,6 +236,7 @@ class FFTDataset(Dataset):
             self.transform,
             self.target_transform,
             self.class_names,
+            self.output_size,
         )
         val_ds = FFTDataset(
             val_samples,
@@ -237,6 +244,7 @@ class FFTDataset(Dataset):
             self.transform,
             self.target_transform,
             self.class_names,
+            self.output_size,
         )
         return train_ds, val_ds
 

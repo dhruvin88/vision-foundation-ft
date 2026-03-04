@@ -13,63 +13,21 @@ import sys
 import time
 from pathlib import Path
 
-import numpy as np
-import torch
-from PIL import Image
-
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-DATA_DIR   = Path(__file__).parent / "datasets" / "oxford_pets_seg"
-OUT_DIR    = Path(__file__).parent / "results" / "seg_pets"
-EPOCHS     = 5
-BATCH      = 4
-LR         = 1e-4
-WORKERS    = 0
-INPUT_SIZE = 224   # keeps it fast on CPU/GPU; 224/14=16 patches
-NUM_CLASSES = 3    # background, pet, boundary
-
-
-class SegDatasetWithResize:
-    """Wraps FFTDataset segmentation samples and resizes masks to output_size."""
-
-    def __init__(self, samples: list[dict], transform, output_size: int) -> None:
-        self.samples     = samples
-        self.transform   = transform
-        self.output_size = output_size
-
-    def __len__(self) -> int:
-        return len(self.samples)
-
-    def __getitem__(self, idx: int) -> dict:
-        s     = self.samples[idx]
-        image = Image.open(s["image_path"]).convert("RGB")
-        mask  = Image.open(s["mask_path"])  # grayscale, NEAREST for class IDs
-
-        if self.transform:
-            image = self.transform(image)
-
-        # Resize mask to output_size with NEAREST interpolation (preserves class IDs)
-        mask = mask.resize((self.output_size, self.output_size), Image.NEAREST)
-        mask = torch.from_numpy(np.array(mask, dtype=np.int64))
-
-        return {"image": image, "mask": mask}
-
-    def split(self, val_ratio: float = 0.2, seed: int = 42):
-        rng     = np.random.RandomState(seed)
-        indices = rng.permutation(len(self.samples))
-        val_n   = int(len(indices) * val_ratio)
-        val_idx, train_idx = indices[:val_n], indices[val_n:]
-
-        train_samples = [self.samples[i] for i in train_idx]
-        val_samples   = [self.samples[i] for i in val_idx]
-
-        train_ds = SegDatasetWithResize(train_samples, self.transform, self.output_size)
-        val_ds   = SegDatasetWithResize(val_samples,   self.transform, self.output_size)
-        return train_ds, val_ds
+DATA_DIR    = Path(__file__).parent / "datasets" / "oxford_pets_seg"
+OUT_DIR     = Path(__file__).parent / "results" / "seg_pets"
+EPOCHS      = 5
+BATCH       = 4
+LR          = 1e-4
+WORKERS     = 0
+INPUT_SIZE  = 224   # 224/14=16 patches; keeps smoke test fast
+NUM_CLASSES = 3     # background, pet, boundary
 
 
 def main() -> None:
     from core.encoders import create_encoder
+    from core.data.dataset import FFTDataset
     from core.decoders.segmentation import UPerNetHead
     from core.training.trainer import Trainer
 
@@ -80,7 +38,6 @@ def main() -> None:
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Build encoder + decoder
     encoder = create_encoder("dinov2_vits14", input_size=INPUT_SIZE)
     decoder = UPerNetHead(
         encoder,
@@ -90,18 +47,13 @@ def main() -> None:
     )
     print(f"Decoder trainable params: {decoder.num_trainable_params():,}")
 
-    # Collect (image_path, mask_path) pairs
-    images_dir = DATA_DIR / "images"
-    masks_dir  = DATA_DIR / "masks"
-    samples    = []
-    for img_path in sorted(images_dir.iterdir()):
-        if img_path.suffix.lower() in {".jpg", ".jpeg", ".png"}:
-            mask_path = masks_dir / f"{img_path.stem}.png"
-            if mask_path.exists():
-                samples.append({"image_path": str(img_path), "mask_path": str(mask_path)})
-    print(f"Dataset: {len(samples)} image/mask pairs")
-
-    dataset  = SegDatasetWithResize(samples, encoder.get_transform(), output_size=INPUT_SIZE)
+    dataset = FFTDataset.from_folder(
+        DATA_DIR,
+        task="segmentation",
+        transform=encoder.get_transform(),
+        output_size=INPUT_SIZE,
+    )
+    print(f"Dataset: {len(dataset)} image/mask pairs")
     train_ds, val_ds = dataset.split()
     print(f"  Train: {len(train_ds)}  Val: {len(val_ds)}")
 

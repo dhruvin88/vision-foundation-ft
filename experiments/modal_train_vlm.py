@@ -31,17 +31,7 @@ hub_vol     = modal.Volume.from_name("fft-hub-cache", create_if_missing=True)
 hf_vol      = modal.Volume.from_name("fft-hf-cache",  create_if_missing=True)
 
 # ── Container image ───────────────────────────────────────────────────────────
-_SKIP = {".venv", "__pycache__", ".git", ".pytest_cache", "checkpoints",
-         "experiments/datasets", "experiments/results", "experiments/results_modal"}
-
-
-def _ignore(path: Path) -> bool:
-    parts = set(path.parts)
-    path_str = path.as_posix()
-    return bool(parts & {".venv", "__pycache__", ".git", ".pytest_cache", "checkpoints"}) or \
-           any(s in path_str for s in ["experiments/datasets", "experiments/results",
-                                        "experiments/results_modal"])
-
+from experiments.modal_utils import modal_ignore as _ignore
 
 image = (
     modal.Image.from_registry(
