@@ -27,6 +27,8 @@ FFT follows a **frozen encoder + lightweight decoder** pattern. Large pretrained
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
+**Note on interface coverage**: The Python SDK (`sdk/__init__.py`) exposes classification, detection, and segmentation heads. The VLM decoder is accessed via the core library directly (`core.decoders.vlm`, `core.training.vlm_trainer`), as it has a different training loop (two-stage, with `VLMTrainer`) that does not fit the general `Trainer` interface.
+
 ## Core Modules
 
 ### Encoders (`core/encoders/`)
@@ -106,12 +108,12 @@ where:
 
 ### Decoders (`core/decoders/`)
 
-All decoders inherit from `BaseDecoder` and accept encoder features (not raw images). This separation means:
+All decoders accept encoder features (not raw images). This separation means:
 - The encoder runs once per image (in `torch.no_grad()`)
 - Only decoder parameters receive gradients
 - Multiple decoders can share the same encoder
 
-Each decoder has a `task` attribute and a `predict(images)` method for end-to-end inference.
+Standard decoders (classification, detection, segmentation) inherit from `BaseDecoder` and have a `task` attribute and a `predict(images)` method for end-to-end inference. The VLM decoder (`VLMDecoder`) is a standalone `nn.Module` with its own training loop.
 
 #### Classification Decoders
 
@@ -275,12 +277,70 @@ Encoder features['patch_tokens']  (B, N, D)
 └────────────────────────────────────────┘
 ```
 
+#### VLM Decoder (`core/decoders/vlm.py`)
+
+`VLMDecoder` implements a LLaVA 1.5-style visual question answering pipeline:
+
+```
+Input Image (B, 3, H, W)
+        ↓
+DINOv2 Encoder (frozen)
+        ↓
+patch_tokens: (B, N, D)   e.g. (B, 256, 384) for vits14 at 224×224
+        ↓
+┌────────────────────────────────────────┐
+│  Spatial Avg-Pool                      │
+│    (B, N, D) → (B, D, h, w)            │
+│    → AvgPool2d(kernel=pool_patches)    │
+│    → (B, D, h', w')                    │
+│    → (B, N', D)                        │  ← N' = N / pool_patches²
+└────────────────────────────────────────┘
+        ↓  e.g. 64 visual tokens (pool_patches=2)
+┌────────────────────────────────────────┐
+│  MLP Projector (2-layer, GELU)         │
+│    Linear(D → llm_dim//2)             │
+│    → GELU                              │
+│    → Linear(llm_dim//2 → llm_dim)     │
+└────────────────────────────────────────┘
+        ↓  (B, N', llm_dim)
+        ↓
+[visual_tokens | question_tokens]   (B, N'+T, llm_dim)
+        ↓
+┌────────────────────────────────────────┐
+│  Causal LLM (Phi-3.5-mini-instruct     │
+│              or TinyLlama-1.1B)        │
+│  Autoregressive generation / CE loss  │
+└────────────────────────────────────────┘
+        ↓
+    Answer tokens
+```
+
+**Chat format** (Phi-3.5-mini native):
+```
+<|user|>
+{question}<|end|>
+<|assistant|>
+{answer}<|end|>
+```
+
+**Two-stage training:**
+- Stage 1 (`freeze_llm=True`): Only the MLP projector is trained. Aligns visual token space with the LLM's embedding space.
+- Stage 2 (`decoder.enable_llm_lora(rank=8)`): LoRA adapters are injected into the LLM's `q_proj` and `v_proj` layers. Projector + LoRA parameters are trained jointly.
+
+**4-bit inference**: `VLMDecoder(load_in_4bit=True)` uses `BitsAndBytesConfig` (NF4, double quantization, bfloat16 compute) to reduce Phi-3.5-mini VRAM from ~14 GB to ~6.4 GB. The LLM is placed on `cuda:0` automatically by the quantization config. When using 4-bit mode, only `decoder.projector` and the encoder should be moved to CUDA manually — calling `decoder.to("cuda")` on the full model will fail.
+
+**Validation metric**: `val_token_acc` — fraction of non-masked (answer) token positions predicted correctly. Reported by `VLMTrainer` at the end of each epoch.
+
 ### Data (`core/data/`)
 
-`FFTDataset` is a unified PyTorch `Dataset` supporting all three tasks. It loads from:
+`FFTDataset` (`core/data/dataset.py`) is a unified PyTorch `Dataset` supporting classification, detection, and segmentation. It loads from:
 - Folder structure (classification: one folder per class)
 - COCO JSON annotations (detection)
 - Image/mask pairs (segmentation)
+
+**`output_size` parameter**: When constructing `FFTDataset` (or calling `from_folder`) for segmentation tasks, an optional `output_size: int | None` parameter can be passed. When set, each mask is resized to `output_size × output_size` using `Image.NEAREST` in `__getitem__`. The same `output_size` is propagated through `split()` to both train and val subsets. This eliminates the need for custom dataset wrappers when encoder input size differs from raw mask size.
+
+`PetsVQADataset` (`core/data/vqa_dataset.py`) is a separate dataset class for VQA tasks. It reads COCO-format annotations and generates synthetic question-answer pairs on the fly using four QA templates (breed, species, spatial location, describe). Chat prompts use Phi-3.5-mini native format (`<|user|>...<|end|>\n<|assistant|>\n`). It has its own `split()` and `collate_fn`.
 
 Format converters (`load_coco`, `load_voc`, `load_yolo`, `load_csv`) normalize different annotation formats into the internal sample list format.
 
@@ -288,11 +348,13 @@ Augmentation presets (`none`, `light`, `heavy`) use Albumentations for task-awar
 
 ### Training (`core/training/`)
 
-`Trainer` wraps PyTorch Lightning with sensible defaults:
+`Trainer` (`core/training/trainer.py`) wraps PyTorch Lightning with sensible defaults:
 - Auto train/val split
 - Warmup + cosine/step LR scheduling
 - Early stopping
 - Checkpoint management
+
+It handles classification, detection, and segmentation tasks. VLM training uses the separate `VLMTrainer` (`core/training/vlm_trainer.py`).
 
 **Training modes:**
 - `"standard"` (default): Standard training loop.
@@ -301,13 +363,16 @@ Augmentation presets (`none`, `light`, `heavy`) use Albumentations for task-awar
 `DecoderLightningModule` handles the training loop, loss computation, and metric tracking per task.
 
 **Loss routing** (detection):
-- If the prediction dict contains `"enc_outputs"` (RTDETRDecoder output), the full RT-DETR loss is used: VFL + L1 + GIoU on final layer, same losses on all 4 aux layers (reusing same Hungarian matches), encoder auxiliary BCE, and CDN loss if CDN outputs are present.
+- If the prediction dict contains `"enc_outputs"` (RTDETRDecoder output), the RT-DETR loss is used: focal BCE + L1 + GIoU on the final layer and all aux layers, plus CDN loss if CDN outputs are present.
 - Otherwise (DETRLiteDecoder), the DETR loss is used: Hungarian matching + CrossEntropy (with `eos_coef=0.1` for no-object) + L1 + GIoU.
 
 **Validation metrics:**
 - Classification: `val_acc` (logged per epoch)
 - Detection: `val_map50` and `val_map` via `torchmetrics.detection.MeanAveragePrecision`
 - Segmentation: `val_loss` (cross-entropy)
+- VLM: `val_token_acc` (fraction of answer tokens predicted correctly), logged by `VLMTrainer`
+
+`VLMTrainer` is a dedicated trainer for `VLMDecoder`. It runs a standard PyTorch training loop (no Lightning) and supports two stages via the `stage` parameter. Stage 1 trains only the MLP projector; Stage 2 trains projector + LLM LoRA parameters.
 
 ### Evaluation (`core/evaluation/`)
 
@@ -372,6 +437,8 @@ Start with: `streamlit run frontend/app.py`
 
 ## Complete Training Flow
 
+### Standard Tasks (Classification / Detection / Segmentation)
+
 ```
 ┌──────────────────┐
 │  Input Image     │
@@ -422,7 +489,7 @@ Start with: `streamlit run frontend/app.py`
 ┌─────────────────────────────────────────────┐
 │  Loss Computation                           │
 │  • CrossEntropy (classification)            │
-│  • RT-DETR: VFL + L1 + GIoU + CDN + aux    │
+│  • RT-DETR: focal BCE + L1 + GIoU + CDN    │
 │  • DETRLite: Hungarian + CE + L1 + GIoU     │
 │  • CrossEntropy (segmentation)              │
 └─────────────────┬───────────────────────────┘
@@ -439,4 +506,24 @@ Start with: `streamlit run frontend/app.py`
 └─────────────────────────────────────────────┘
 ```
 
-**Memory efficiency**: Since encoder gradients are never computed (in standard mode), GPU memory usage is dominated by decoder activations and optimizer states. A 1B-parameter encoder + 10M-parameter decoder uses similar memory to training a 10M-parameter model from scratch. With LoRA, a small additional overhead is incurred for the LoRA A/B parameters and their gradients.
+### VLM Task (Two-Stage)
+
+```
+                     Stage 1                    Stage 2
+                  (projector only)         (projector + LLM LoRA)
+                  ─────────────           ────────────────────────
+
+Input Image ──► DINOv2 (frozen) ──► patch_tokens
+                                         │
+                                   AvgPool + MLP projector ◄── gradients
+                                         │
+             Question tokens ──────────► [visual | text] embeddings
+                                         │
+                                   Phi-3.5-mini (frozen)    Phi-3.5-mini + LoRA ◄── gradients
+                                         │
+                                   Answer logits
+                                         │
+                                   CrossEntropy loss (answer positions only)
+```
+
+**Memory efficiency**: Since encoder gradients are never computed (in standard mode), GPU memory usage is dominated by decoder activations and optimizer states. A 1B-parameter encoder + 10M-parameter decoder uses similar memory to training a 10M-parameter model from scratch. With LoRA, a small additional overhead is incurred for the LoRA A/B parameters and their gradients. VLM Stage 1 requires only projector optimizer states; Stage 2 adds LLM LoRA parameters (~tens of MB for rank=8 on Phi-3.5-mini).

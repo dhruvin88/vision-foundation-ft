@@ -25,7 +25,7 @@ pip install -e ".[dev]"
 pip install -e ".[all]"
 ```
 
-Encoder weights download automatically on first use:
+Core dependencies include `transformers>=4.50.0` and `bitsandbytes>=0.41.0`. Encoder weights download automatically on first use:
 - DINOv3 models download from HuggingFace (`facebook/dinov3-*`)
 - DINOv2 models download from `torch.hub` (`facebookresearch/dinov2`)
 
@@ -167,18 +167,197 @@ seg_dataset/
     img_002.png
 ```
 
-### Train
+Masks must be grayscale PNGs where each pixel value is a class ID. For Oxford Pets trimap segmentation the mapping is: 0=background, 1=pet, 2=boundary.
+
+### Prepare Oxford Pets Segmentation Data
+
+```bash
+python experiments/prepare_oxford_pets_seg.py
+# Downloads Oxford Pets trimaps (~800 MB), remaps to 3-class masks
+# Output: experiments/datasets/oxford_pets_seg/
+#   images/  — JPEG images
+#   masks/   — grayscale PNGs with values 0/1/2
+```
+
+### Train Locally (Smoke Test)
+
+```bash
+python experiments/train_seg_pets.py
+# dinov2_vits14 + UPerNetHead, 3 classes, input_size=224
+# 5 epochs, batch=4, for quick validation
+```
+
+### Train with the SDK
 
 ```python
 import sdk as fft
 
 encoder = fft.Encoder("dinov2_vitb14")
-head = fft.SegmentationHead(encoder, num_classes=5, head_type="upernet")
+head = fft.SegmentationHead(encoder, num_classes=3, head_type="upernet")
 # UPerNet auto-enables intermediate layer extraction
 
-dataset = fft.Dataset.from_folder("./seg_dataset/", task="segmentation")
-trainer = fft.Trainer(head, dataset, lr=1e-4, epochs=50)
+# output_size resizes masks to match encoder input size using Image.NEAREST
+dataset = fft.Dataset.from_folder(
+    "./seg_dataset/",
+    task="segmentation",
+    transform=encoder.get_transform(),
+    output_size=518,   # set to encoder input size (518 for dinov2_vitb14 default)
+)
+trainer = fft.Trainer(head, dataset, lr=1e-4, epochs=30)
 trainer.fit()
+```
+
+**Why `output_size`?** The raw mask PNG may have a different resolution than the encoder's expected input. When `output_size` is set, `FFTDataset` resizes each mask to `output_size × output_size` using `Image.NEAREST` (preserving integer class IDs, no interpolation artifacts). The same value should match the encoder input size so that the spatial grid dimensions align.
+
+### Train on Modal A10G
+
+For full-resolution, longer training runs:
+
+```bash
+# One-time dataset upload to Modal volume
+modal run experiments/modal_train_seg.py::upload_dataset
+
+# Run training (30 epochs, LoRA rank=4, input_size=448, A10G)
+modal run --detach experiments/modal_train_seg.py
+
+# Download results
+modal volume get fft-results /seg_pets ./experiments/results_modal/seg_pets
+```
+
+Configurable via CLI arguments:
+```bash
+# Larger encoder, quick smoke test:
+modal run experiments/modal_train_seg.py -- --encoder dinov2_vitb14 --epochs 3
+```
+
+**Result (Oxford Pets):** val_loss=0.1375 (15 epochs, early stopped on A10G).
+
+---
+
+## Visual Question Answering (VLM)
+
+The VLM decoder uses a LLaVA 1.5-style architecture: DINOv2 patch tokens → MLP projector → Phi-3.5-mini-instruct. Training is two-stage.
+
+### Prerequisites
+
+```bash
+pip install transformers accelerate sentencepiece
+python experiments/prepare_oxford_pets.py   # if not already done
+```
+
+### Train Locally (TinyLlama, CPU/GPU)
+
+```bash
+python experiments/train_vlm_pets.py
+# dinov2_vits14 + TinyLlama-1.1B (local default)
+# Stage 1: 3 epochs projector alignment (lr=1e-3)
+# Stage 2: 10 epochs instruction tuning (lr=2e-5, LoRA rank=8)
+# Results: experiments/results/vlm_pets/
+```
+
+### Train on Modal A10G (Phi-3.5-mini)
+
+```bash
+# One-time dataset upload (reuses fft-datasets volume if detection already uploaded)
+modal run experiments/modal_train_vlm.py::upload_dataset
+
+# Run training (Stage 1: 3 epochs + Stage 2: 10 epochs)
+modal run experiments/modal_train_vlm.py
+
+# Download results
+modal volume get fft-results /vlm_pets ./experiments/results_modal/vlm_pets
+```
+
+Configurable arguments:
+```bash
+# Larger encoder:
+modal run experiments/modal_train_vlm.py -- --encoder dinov2_vitb14
+
+# Quick smoke-test (1+2 epochs):
+modal run experiments/modal_train_vlm.py -- --s1-epochs 1 --s2-epochs 2
+```
+
+**Result (Oxford Pets):** val_token_acc=99.15% (13 epochs, A10G).
+
+### Using the VLM API Directly
+
+```python
+from core.encoders import create_encoder
+from core.decoders.vlm import VLMDecoder
+from core.data.vqa_dataset import PetsVQADataset
+from core.training.vlm_trainer import VLMTrainer
+
+encoder = create_encoder("dinov2_vits14", input_size=224)
+
+# Stage 1: projector alignment only
+decoder = VLMDecoder(
+    encoder,
+    llm_name="microsoft/Phi-3.5-mini-instruct",
+    freeze_llm=True,
+    lora_rank=0,
+    pool_patches=2,    # 16×16 → 8×8 = 64 visual tokens
+)
+
+dataset = PetsVQADataset(
+    annotations_json="./datasets/oxford_pets/annotations.json",
+    images_dir="./datasets/oxford_pets/images/",
+    tokenizer=decoder.tokenizer,
+    transform=encoder.get_transform(),
+)
+train_ds, val_ds = dataset.split()
+
+stage1 = VLMTrainer(
+    decoder, train_ds, val_ds,
+    lr=1e-3, epochs=3, batch_size=4,
+    stage=1, warmup_epochs=1,
+)
+results1 = stage1.fit()
+
+# Stage 2: unlock LLM LoRA, retrain
+decoder.enable_llm_lora(rank=8)
+stage2 = VLMTrainer(
+    decoder, train_ds, val_ds,
+    lr=2e-5, epochs=10, batch_size=4,
+    stage=2, warmup_epochs=2, early_stopping_patience=5,
+)
+results2 = stage2.fit()
+print(f"val_token_acc: {results2['val_token_acc']:.4f}")
+```
+
+### 4-Bit Inference on Machines with Limited VRAM
+
+```python
+from core.encoders import create_encoder
+from core.decoders.vlm import VLMDecoder
+
+encoder = create_encoder("dinov2_vits14", input_size=224)
+encoder.to("cuda")
+
+decoder = VLMDecoder(
+    encoder,
+    llm_name="microsoft/Phi-3.5-mini-instruct",
+    load_in_4bit=True,   # NF4 quantization; LLM placed on cuda:0 automatically
+)
+# Only move the projector manually — do NOT call decoder.to("cuda")
+decoder.projector.to("cuda")
+
+# Run generation
+import torch
+image_t = encoder.get_transform()(image).unsqueeze(0).to("cuda")
+with torch.no_grad():
+    features = encoder.forward_features(image_t)
+
+enc = decoder.tokenizer(
+    "<|user|>\nWhat breed is this pet?<|end|>\n<|assistant|>\n",
+    return_tensors="pt",
+)
+answers = decoder.generate(
+    features,
+    enc["input_ids"].to("cuda"),
+    enc["attention_mask"].to("cuda"),
+    max_new_tokens=32,
+)
+print(answers[0])
 ```
 
 ---
@@ -221,6 +400,8 @@ LoRA adds trainable `A` and `B` matrices of rank `r` alongside each target linea
 
 Add `_reg` to any DINOv2 variant (e.g., `dinov2_vitb14_reg`) for register token variants with improved attention maps — beneficial for detection and segmentation.
 
+DINOv2 is preferred over DINOv3 for the VLM and segmentation tasks in the benchmarks above (`dinov2_vits14`, `input_size=224` for VLM; `dinov2_vits14`, `input_size=448` for segmentation).
+
 ---
 
 ## Choosing a Decoder
@@ -231,7 +412,7 @@ Add `_reg` to any DINOv2 variant (e.g., `dinov2_vitb14_reg`) for register token 
 - **transformer** (`TransformerHead`): Cross-attention from learnable class queries to patch tokens. Most expressive.
 
 ### Detection
-- **rtdetr** (`RTDETRDecoder`) — default: RT-DETRv2-inspired. Multi-scale ViT+CNN fusion, VFL loss, CDN. Best mAP, ~8M params, converges in 20–30 epochs.
+- **rtdetr** (`RTDETRDecoder`) — default: RT-DETRv2-inspired. Multi-scale ViT+CNN fusion, VFL loss, CDN. Best mAP, ~8M params, converges in 20–50 epochs.
 - **detr_lite** (`DETRLiteDecoder`): Single-scale DETR. Simpler, ~3M params, needs 50–100 epochs.
 - **fpn** (`FPNHead`): Anchor-based Feature Pyramid Network. Requires intermediate layers (auto-set).
 
@@ -239,6 +420,9 @@ Add `_reg` to any DINOv2 variant (e.g., `dinov2_vitb14_reg`) for register token 
 - **linear** (`LinearSegHead`): Per-patch 1×1 conv + bilinear upsample. Fastest.
 - **upernet** (`UPerNetHead`): Pyramid pooling + top-down FPN. Strongest for dense scenes.
 - **mask_transformer** (`MaskTransformerHead`): Learnable class queries dot-producted with patch tokens.
+
+### VLM
+- `VLMDecoder` — MLP projector + causal LLM (Phi-3.5-mini-instruct or TinyLlama). Use the core API directly; not available in the `sdk` module.
 
 ---
 

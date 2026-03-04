@@ -1,6 +1,6 @@
 # Foundation Model Fine-Tuning (FFT)
 
-> Fine-tune lightweight decoder heads on frozen vision foundation models for classification, object detection, and semantic segmentation.
+> Fine-tune lightweight decoder heads on frozen vision foundation models for classification, object detection, semantic segmentation, and visual question answering.
 
 ## Table of Contents
 
@@ -11,6 +11,7 @@
 - [Usage](#usage)
 - [Configuration Reference](#configuration-reference)
 - [Testing](#testing)
+- [Experiments](#experiments)
 - [Key Concepts](#key-concepts)
 
 ---
@@ -23,9 +24,19 @@ FFT lets you adapt large pretrained vision models (DINOv2, DINOv3) to new tasks 
 - Image classification on a custom dataset
 - Object detection with RT-DETR or DETR-style heads
 - Semantic segmentation with UPerNet or linear heads
+- Visual question answering (VLM): encoder + MLP projector + language model
 - LoRA-based partial encoder fine-tuning when frozen features are insufficient
 
 **Intended audience:** ML practitioners and researchers who want strong vision baselines quickly.
+
+**Proven benchmark results on Oxford-IIIT Pets (37 breeds):**
+
+| Task | Architecture | Result |
+|------|-------------|--------|
+| Classification | DINOv2 ViT-S/14 + linear head | Working |
+| Detection | DINOv2 ViT-S/14 + RTDETRDecoder | val_map50=74.6%, val_map=49.4% (60 epochs) |
+| Segmentation | DINOv2 ViT-S/14 + UPerNetHead | val_loss=0.1375 (15 epochs, A10G, early stopped) |
+| VLM | DINOv2 ViT-S/14 + Phi-3.5-mini-instruct | val_token_acc=99.15% (13 epochs, A10G) |
 
 ---
 
@@ -43,15 +54,15 @@ FFT lets you adapt large pretrained vision models (DINOv2, DINOv3) to new tasks 
 │  Optional: LoRA adapters on attention layers     │
 └──────────────────────┬──────────────────────────┘
                        │  feature dict
-          ┌────────────┼────────────┐
-          ▼            ▼            ▼
-┌─────────────┐ ┌────────────┐ ┌──────────────┐
-│Classification│ │ Detection  │ │ Segmentation │
-├─────────────┤ ├────────────┤ ├──────────────┤
-│ LinearProbe │ │ RTDETRDec. │ │ LinearSeg    │
-│ MLPHead     │ │ DETRLite   │ │ UPerNet      │
-│ Transformer │ │ FPNHead    │ │ MaskTransf.  │
-└─────────────┘ └────────────┘ └──────────────┘
+          ┌────────────┼──────────────┬────────────┐
+          ▼            ▼              ▼            ▼
+┌─────────────┐ ┌────────────┐ ┌──────────────┐ ┌───────────┐
+│Classification│ │ Detection  │ │ Segmentation │ │    VLM    │
+├─────────────┤ ├────────────┤ ├──────────────┤ ├───────────┤
+│ LinearProbe │ │ RTDETRDec. │ │ LinearSeg    │ │ MLP proj. │
+│ MLPHead     │ │ DETRLite   │ │ UPerNet      │ │ + LLM     │
+│ Transformer │ │ FPNHead    │ │ MaskTransf.  │ │           │
+└─────────────┘ └────────────┘ └──────────────┘ └───────────┘
 ```
 
 The encoder runs in `torch.no_grad()` (or via LoRA gradients when enabled). Only the decoder parameters receive gradients, so GPU memory is dominated by the decoder, not the 300M–1.5B parameter encoder.
@@ -81,9 +92,9 @@ Interfaces
 ```
 core/
   encoders/          # DINOv2Encoder, DINOv3Encoder, LoRA injection
-  decoders/          # RTDETRDecoder, DETRLite, FPNHead, classification, segmentation heads
-  data/              # FFTDataset, format converters (COCO/VOC/YOLO/CSV), augmentations
-  training/          # PyTorch Lightning Trainer, schedulers, callbacks
+  decoders/          # RTDETRDecoder, DETRLite, FPNHead, classification, segmentation, VLM heads
+  data/              # FFTDataset, PetsVQADataset, format converters (COCO/VOC/YOLO/CSV)
+  training/          # Trainer, VLMTrainer, schedulers, callbacks
   evaluation/        # run_inference(), compute_metrics()
   export/            # save/load decoder weights, inference script generation
   cli.py             # fft CLI entry point
@@ -98,10 +109,17 @@ frontend/
   app.py             # Streamlit entry point
   pages/             # 1_Dataset, 2_Model, 3_Training, 4_Results, 5_Inference
 experiments/
-  prepare_oxford_pets.py  # Download Oxford-IIIT Pets, convert masks to COCO boxes
-  train_deim_pets.py      # RTDETRDecoder training on Oxford Pets (37 classes)
-  datasets/               # Local dataset storage (gitignored)
-  results/                # Training results (gitignored)
+  prepare_oxford_pets.py      # Download Oxford-IIIT Pets, convert masks to COCO boxes
+  prepare_oxford_pets_seg.py  # Download Oxford-IIIT Pets trimaps, remap to 3-class masks
+  train_deim_pets.py          # RTDETRDecoder detection on Oxford Pets (37 classes, local)
+  train_seg_pets.py           # UPerNetHead segmentation smoke test (local)
+  train_vlm_pets.py           # Two-stage VLM training on Oxford Pets (local, TinyLlama)
+  modal_train_vlm.py          # Modal A10G VLM training (Phi-3.5-mini, 2-stage)
+  modal_train_seg.py          # Modal A10G segmentation training (UPerNet, 30 epochs)
+  modal_utils.py              # Shared modal_ignore() filter for Modal image mounts
+  datasets/                   # Local dataset storage (gitignored)
+  results/                    # Local training results (gitignored)
+  results_modal/              # Downloaded Modal results (gitignored)
 examples/
   classification_example.py
   detection_example.py / detection_e2e.py
@@ -148,7 +166,7 @@ pip install -e ".[dev]"
 pip install -e ".[all]"
 ```
 
-The `transformers` package is a core dependency (required for DINOv3). DINOv2 weights are fetched from `torch.hub` (`facebookresearch/dinov2`). Both download automatically on first use.
+Core dependencies include `transformers>=4.50.0` and `bitsandbytes>=0.41.0` (required for 4-bit quantized VLM inference). DINOv3 weights download from HuggingFace (`facebook/dinov3-*`); DINOv2 weights from `torch.hub` (`facebookresearch/dinov2`). Both download automatically on first use.
 
 ### Running the Application
 
@@ -212,8 +230,8 @@ trainer.save("./classifier.pt")
 ```python
 import sdk as fft
 
-encoder = fft.Encoder("dinov2_vitb14")          # RTDETRDecoder sets its intermediate layers
-head = fft.DetectionHead(encoder, num_classes=10) # defaults to head_type="rtdetr"
+encoder = fft.Encoder("dinov2_vitb14")
+head = fft.DetectionHead(encoder, num_classes=10)  # defaults to head_type="rtdetr"
 
 dataset = fft.Dataset.from_folder("./detection_dataset/", task="detection")
 
@@ -244,11 +262,17 @@ Boxes must be in `[x, y, w, h]` pixel coordinates in the JSON; the dataset loade
 import sdk as fft
 
 encoder = fft.Encoder("dinov2_vitb14")
-head = fft.SegmentationHead(encoder, num_classes=5, head_type="upernet")
+head = fft.SegmentationHead(encoder, num_classes=3, head_type="upernet")
 # UPerNet auto-enables intermediate layer extraction
 
-dataset = fft.Dataset.from_folder("./seg_dataset/", task="segmentation")
-trainer = fft.Trainer(head, dataset, lr=1e-4, epochs=50)
+# output_size resizes masks to match the encoder's spatial grid
+dataset = fft.Dataset.from_folder(
+    "./seg_dataset/",
+    task="segmentation",
+    transform=encoder.get_transform(),
+    output_size=518,   # resize masks to 518×518; use encoder input size
+)
+trainer = fft.Trainer(head, dataset, lr=1e-4, epochs=30)
 trainer.fit()
 ```
 
@@ -258,8 +282,79 @@ seg_dataset/
   images/
     img_001.jpg
   masks/
-    img_001.png     # pixel values = class IDs (0-based)
+    img_001.png     # grayscale PNG; pixel values = class IDs (0-based)
 ```
+
+The `output_size` parameter on `FFTDataset` (and `from_folder`) resizes segmentation masks to a square of this size using `Image.NEAREST` (preserving integer class IDs). Pass the same value as the encoder input size to ensure mask and feature dimensions align.
+
+#### Visual Question Answering (VLM)
+
+```python
+from core.encoders import create_encoder
+from core.decoders.vlm import VLMDecoder
+from core.data.vqa_dataset import PetsVQADataset
+from core.training.vlm_trainer import VLMTrainer
+
+encoder = create_encoder("dinov2_vits14", input_size=224)
+
+# Stage 1: projector-only alignment (LLM frozen)
+decoder = VLMDecoder(
+    encoder,
+    llm_name="microsoft/Phi-3.5-mini-instruct",
+    freeze_llm=True,
+    lora_rank=0,
+    pool_patches=2,    # 16×16 → 8×8 = 64 visual tokens
+)
+
+dataset = PetsVQADataset(
+    annotations_json="./oxford_pets/annotations.json",
+    images_dir="./oxford_pets/images/",
+    tokenizer=decoder.tokenizer,
+    transform=encoder.get_transform(),
+)
+train_ds, val_ds = dataset.split()
+
+stage1 = VLMTrainer(decoder, train_ds, val_ds, lr=1e-3, epochs=3, stage=1)
+stage1.fit()
+
+# Stage 2: instruction tuning with LLM LoRA
+decoder.enable_llm_lora(rank=8)
+stage2 = VLMTrainer(decoder, train_ds, val_ds, lr=2e-5, epochs=10, stage=2)
+stage2.fit()
+```
+
+**4-bit GPU inference** (for machines with limited VRAM):
+```python
+decoder = VLMDecoder(
+    encoder,
+    llm_name="microsoft/Phi-3.5-mini-instruct",
+    load_in_4bit=True,   # NF4 quantization via bitsandbytes
+)
+# When load_in_4bit=True, the LLM is placed on cuda:0 automatically.
+# Do NOT call decoder.to("cuda") — only move the projector and encoder manually:
+decoder.projector.to("cuda")
+encoder.to("cuda")
+```
+
+**Inference (generation):**
+```python
+import torch
+
+features = encoder.forward_features(image_tensor.to("cuda"))
+enc = decoder.tokenizer(
+    "<|user|>\nWhat breed of animal is in this image?<|end|>\n<|assistant|>\n",
+    return_tensors="pt",
+)
+answers = decoder.generate(
+    features,
+    enc["input_ids"].to("cuda"),
+    enc["attention_mask"].to("cuda"),
+    max_new_tokens=32,
+)
+print(answers[0])
+```
+
+The VLM is not exposed in the `sdk` module. Use the `core.decoders.vlm` and `core.training.vlm_trainer` APIs directly.
 
 #### LoRA Fine-Tuning
 
@@ -345,6 +440,7 @@ Full interactive docs are available at `http://localhost:8000/docs` when the bac
 | Segmentation | `LinearSegHead` | 1×1 conv per patch + upsample |
 | Segmentation | `UPerNetHead` | Pyramid pooling, multi-scale |
 | Segmentation | `MaskTransformerHead` | Dot-product mask prediction |
+| VLM | `VLMDecoder` | MLP projector + causal LLM; use core API directly |
 
 ---
 
@@ -390,6 +486,20 @@ dataset = load_yolo("./labels/", "./images/", class_names=["cat", "dog"])
 dataset = load_csv("labels.csv", "./images/")
 ```
 
+**Segmentation `output_size` parameter:**
+
+```python
+# masks are resized to output_size × output_size using Image.NEAREST
+dataset = fft.Dataset.from_folder(
+    "./seg_data/",
+    task="segmentation",
+    transform=encoder.get_transform(),
+    output_size=448,
+)
+```
+
+This is the canonical way to match mask resolution to the encoder's spatial grid (e.g., input_size=448, patch_size=14 → 32×32 grid). Without it, mask shape may mismatch decoder output size at loss computation.
+
 ---
 
 ## Configuration Reference
@@ -425,6 +535,16 @@ All configuration is passed as constructor/function arguments; there are no conf
 | `max_gt_per_image` | `30` | CDN group size cap |
 | `label_noise_ratio` | `0.5` | Label flip probability for CDN positive queries |
 | `box_noise_scale` | `1.0` | Box perturbation scale for CDN |
+
+### VLMDecoder Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `llm_name` | `"TinyLlama/TinyLlama-1.1B-Chat-v1.0"` | HuggingFace model ID |
+| `freeze_llm` | `True` | Freeze LLM weights (Stage 1 mode) |
+| `lora_rank` | `0` | Apply LoRA to LLM at construction (0 = off) |
+| `pool_patches` | `2` | Spatial pooling factor for patch tokens |
+| `load_in_4bit` | `False` | Load LLM in 4-bit NF4 quantization (requires bitsandbytes) |
 
 ### Environment Variables
 
@@ -464,7 +584,9 @@ pytest tests/ --cov=core --cov=sdk
 
 ## Experiments
 
-### Oxford-IIIT Pets Detection
+All experiments use the Oxford-IIIT Pets dataset (37 breeds, ~7,393 images).
+
+### Detection: Oxford-IIIT Pets
 
 Reproduces a 37-class pet detection experiment using mask-derived bounding boxes.
 
@@ -475,15 +597,95 @@ python experiments/prepare_oxford_pets.py
 # Output: experiments/datasets/oxford_pets/  (~3,673 images)
 ```
 
-**Step 2: Train**
+**Step 2: Train locally**
 ```bash
 python experiments/train_deim_pets.py
-# dinov2_vits14 + RTDETRDecoder (frozen, no LoRA)
+# dinov2_vits14 + RTDETRDecoder (frozen, no LoRA), input_size=378
 # 60 epochs, batch=8, LR=1e-4, cosine schedule, 20-epoch patience
-# Results saved to experiments/results/deim_pets_no_lora/
+# Results: experiments/results/deim_pets_no_lora/
 ```
 
-**Known results:** ~14–15% mAP@50 after 20 epochs, still improving at epoch 19. Mosaic augmentation disabled at 50% of training to improve convergence.
+**Result:** val_map50=74.6%, val_map=49.4% (60 epochs).
+
+### Segmentation: Oxford-IIIT Pets
+
+Trimap-based 3-class segmentation (background=0, pet=1, boundary=2).
+
+**Step 1: Prepare data**
+```bash
+python experiments/prepare_oxford_pets_seg.py
+# Downloads Oxford Pets trimaps, remaps to 3 classes
+# Output: experiments/datasets/oxford_pets_seg/  (images/ and masks/)
+```
+
+**Step 2: Local smoke test**
+```bash
+python experiments/train_seg_pets.py
+# dinov2_vits14 + UPerNetHead, 3 classes, input_size=224
+# 5 epochs, batch=4, LR=1e-4
+# Results: experiments/results/seg_pets/
+```
+
+**Step 3: Full training on Modal A10G**
+```bash
+# One-time dataset upload
+modal run experiments/modal_train_seg.py::upload_dataset
+
+# Submit training job (30 epochs, LoRA rank=4, input_size=448)
+modal run --detach experiments/modal_train_seg.py
+
+# Download results
+modal volume get fft-results /seg_pets ./experiments/results_modal/seg_pets
+```
+
+**Result:** val_loss=0.1375 (15 epochs, early stopped on A10G).
+
+### VLM: Oxford-IIIT Pets Visual Q&A
+
+Two-stage VLM training: DINOv2 patch tokens → MLP projector → Phi-3.5-mini-instruct.
+
+**Prerequisites:**
+```bash
+pip install transformers accelerate sentencepiece
+python experiments/prepare_oxford_pets.py   # reuses detection dataset
+```
+
+**Local training (TinyLlama, CPU/GPU):**
+```bash
+python experiments/train_vlm_pets.py
+# dinov2_vits14 + TinyLlama-1.1B (local default) or Phi-3.5-mini
+# Stage 1: 3 epochs projector alignment
+# Stage 2: 10 epochs instruction tuning (LoRA rank=8)
+# Results: experiments/results/vlm_pets/
+```
+
+**Cloud training on Modal A10G (Phi-3.5-mini):**
+```bash
+# One-time dataset upload (reuses fft-datasets/oxford_pets if already uploaded)
+modal run experiments/modal_train_vlm.py::upload_dataset
+
+# Submit training job
+modal run experiments/modal_train_vlm.py
+
+# Download results
+modal volume get fft-results /vlm_pets ./experiments/results_modal/vlm_pets
+```
+
+**Result:** val_token_acc=99.15% (13 epochs, A10G).
+
+### Modal Infrastructure
+
+Both Modal scripts (`modal_train_vlm.py` and `modal_train_seg.py`) share:
+- A10G GPU (24 GB VRAM) via `gpu="A10G"`
+- Persistent volumes: `fft-datasets`, `fft-results`, `fft-hub-cache` (and `fft-hf-cache` for VLM)
+- `modal_ignore()` from `experiments/modal_utils.py` to filter large/local-only directories from the image mount
+
+```python
+# experiments/modal_utils.py
+from experiments.modal_utils import modal_ignore
+
+image = modal.Image.from_registry(...).add_local_dir(ROOT, remote_path="/app", ignore=modal_ignore)
+```
 
 ---
 
@@ -506,6 +708,12 @@ python experiments/train_deim_pets.py
 **Contrastive Denoising (CDN)**: Training-time technique that prepends noisy GT queries to the decoder. Positive CDN queries start near GT boxes; negative CDN queries start far. The decoder must distinguish them, providing additional supervised signal.
 
 **Intermediate layers**: Multi-scale feature extraction from intermediate ViT blocks. Set via `encoder.intermediate_layers = [i, j, k]` or via `encoder.default_intermediate_layers()`. Required for FPN and UPerNet; set automatically by RTDETRDecoder.
+
+**VLMDecoder**: LLaVA 1.5-style architecture. DINOv2 patch tokens are spatially avg-pooled (reducing token count) and projected by a 2-layer MLP into the LLM's embedding space. The resulting visual tokens are prepended to the tokenized question before being passed to a causal language model (Phi-3.5-mini-instruct or TinyLlama). Training is two-stage: (1) projector alignment with LLM frozen, (2) instruction tuning with LLM LoRA.
+
+**`output_size` (FFTDataset)**: Segmentation-specific parameter. When set, masks are resized to `output_size × output_size` using `Image.NEAREST` in `__getitem__` and `split()`. This eliminates the need for custom dataset wrappers when encoder input size differs from raw mask size.
+
+**4-bit NF4 quantization**: `VLMDecoder(load_in_4bit=True)` loads the LLM via `BitsAndBytesConfig` (double quantization, NF4 type, bfloat16 compute). Reduces Phi-3.5-mini VRAM from ~14 GB to ~6.4 GB, enabling inference on an RTX 2060. When quantized, the model is placed on `cuda:0` automatically — do not call `decoder.to("cuda")` on the full model.
 
 ---
 
