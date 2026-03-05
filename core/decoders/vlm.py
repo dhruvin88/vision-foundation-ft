@@ -245,7 +245,14 @@ class VLMDecoder(nn.Module):
         for name, param in self.llm.named_parameters():
             if "lora_" in name:
                 param.requires_grad = True
-        logger.info("LLM LoRA enabled: rank=%d, %d layers patched", rank, n)
+        # LoRA A/B are initialized on CPU; move them to the LLM's device.
+        # This is required when the LLM is on CUDA via device_map (e.g. 4-bit).
+        target_device = self.llm.get_input_embeddings().weight.device
+        for module in self.llm.modules():
+            if hasattr(module, "lora_A"):
+                module.lora_A.to(target_device)
+                module.lora_B.to(target_device)
+        logger.info("LLM LoRA enabled: rank=%d, %d layers patched, device=%s", rank, n, target_device)
         return n
 
     def trainable_parameters(self) -> list[nn.Parameter]:

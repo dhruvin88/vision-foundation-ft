@@ -133,6 +133,13 @@ class DecoderLightningModule(pl.LightningModule):
                 box_format="xyxy", iou_type="bbox"
             )
 
+        # mIoU metric for segmentation validation
+        if self.task == "segmentation":
+            from torchmetrics.classification import MulticlassJaccardIndex
+            self.val_miou = MulticlassJaccardIndex(
+                num_classes=decoder.num_classes, average="macro"
+            )
+
     def on_train_epoch_start(self) -> None:
         if not self.deim_mode:
             return
@@ -593,12 +600,21 @@ class DecoderLightningModule(pl.LightningModule):
 
                 self.val_map.update(map_preds, map_targets)
 
+        elif self.task == "segmentation":
+            preds = predictions.argmax(dim=1)  # (B, H, W) predicted class per pixel
+            self.val_miou.update(preds, batch["mask"])
+
     def on_validation_epoch_end(self) -> None:
         if self.task == "detection":
             map_metrics = self.val_map.compute()
             self.log("val_map50", map_metrics["map_50"], prog_bar=True, sync_dist=True)
             self.log("val_map", map_metrics["map"], prog_bar=True, sync_dist=True)
             self.val_map.reset()
+
+        elif self.task == "segmentation":
+            miou = self.val_miou.compute()
+            self.log("val_miou", miou, prog_bar=True, sync_dist=True)
+            self.val_miou.reset()
 
     def configure_optimizers(self) -> dict:
         # Only optimize decoder parameters
@@ -808,6 +824,8 @@ class Trainer:
             self._results["val_map50"] = float(logged_metrics["val_map50"])
         if "val_map" in logged_metrics:
             self._results["val_map"] = float(logged_metrics["val_map"])
+        if "val_miou" in logged_metrics:
+            self._results["val_miou"] = float(logged_metrics["val_miou"])
 
         return self._results
 
